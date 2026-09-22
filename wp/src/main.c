@@ -78,7 +78,7 @@ enum programmer_state {
         WAIT_FOR_PC_RECEIVED,
         SEND_RECEIVED_TO_TAG,
         WAIT_FOR_RECEIVED_ACK,
-        TRANSFER_COMPLETE
+        SWITCH_TO_RX
 };
 static volatile enum programmer_state programmer_state = WAIT_FOR_PC_PAIR_ACK;
 
@@ -450,11 +450,11 @@ static void handle_tx_success(const struct esb_evt *event)
 {
         LOG_INF("ESB TX success, attempts: %u", event->tx_attempts); // Log number of retransmission attempts.
 
-        // Different actions based on current programmer state (currently only one WP transmission takes place).
+        // Different actions based on current programmer state.
         switch(programmer_state) {
         case WAIT_FOR_RECEIVED_ACK: // Awaiting acknowledgement that the tag received the PC's data acknowledgement.
                 LOG_INF("Tag acknowledged RECEIVED message");
-                programmer_state = TRANSFER_COMPLETE; // Protocol is complete if the wireless programmer has received the acknowledgement.
+                programmer_state = SWITCH_TO_RX; // Return to receive mode ready for the tag's next data packet.
                 break;
 
         default: // Unexpected success from unspecified ESB transmission.
@@ -661,10 +661,17 @@ int main(void)
                         programmer_state = WAIT_FOR_RECEIVED_ACK; // Await confirmation from the tag that it received the message.
                         break;
 
-                case TRANSFER_COMPLETE:
-                        // Protocol completed.
-                        LOG_INF("Transfer complete");
-                        k_sleep(K_FOREVER); // Stop checking states and become idle.
+                case SWITCH_TO_RX:
+                        LOG_INF("Transfer complete; switching programmer back to PRX");
+
+                        err = esb_switch_mode(ESB_MODE_PTX, ESB_MODE_PRX);
+                        if (err) {
+                                LOG_ERR("Failed to switch ESB back to PRX: %d", err);
+                                break;
+                        }
+
+                        programmer_state = WAIT_FOR_TAG_DATA;
+                        LOG_INF("Programmer ready for next tag data packet");
                         break;
 
                 default:

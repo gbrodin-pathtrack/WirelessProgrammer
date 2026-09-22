@@ -46,7 +46,7 @@ enum tag_state {
         WAIT_FOR_DATA_ACK,
         SWITCH_TO_RX,
         WAIT_FOR_PC_RECEIVED,
-        TAG_COMPLETE
+        SWITCH_TO_TX
 };
 
 static volatile enum tag_state tag_state = SEND_PROGRAMMER_PAIR;
@@ -124,8 +124,8 @@ static void handle_esb_message(const struct esb_payload *packet)
         case WAIT_FOR_PC_RECEIVED: // Currently only one expected state for when tag is in RX mode.
                 if (validate_esb_packet(packet, PROGRAMMER_ID, TAG_ID, ESB_RECEIVED)) { // Make sure packet follows expected structure.
                         LOG_INF("Valid PC data acknowledgement received");
-                        tag_state = TAG_COMPLETE; // Complete state (protocol finished)
-                        LOG_INF("Tag data-transfer complete");
+                        tag_state = SWITCH_TO_TX; // Return to transmit mode for the next data packet.
+                        LOG_INF("Tag data transfer complete");
                 }
                 break;
 
@@ -364,6 +364,7 @@ int main(void)
                         break;
 
                 case SEND_TAG_DATA: // After getting a pair acknowledgement, transmit stored data to be relayed to the PC.
+                        k_sleep(K_SECONDS(1)); // Pace repeated transfers so the tag does not spam the programmer and PC.
                         err = send_test_data(); // Call mock data-transmission function.
                         if (err) {
                                 LOG_ERR("Failed to send data: %d", err);
@@ -393,10 +394,16 @@ int main(void)
                         // Also handled by ESB event-handler.
                         break;
 
-                case TAG_COMPLETE:
-                        // Protocol completed.
-                        LOG_INF("Transfer complete");
-                        k_sleep(K_FOREVER); // Stop checking states and become idle.
+                case SWITCH_TO_TX:
+                        LOG_INF("Switching tag back to PTX for the next transfer");
+
+                        err = esb_switch_mode(ESB_MODE_PRX, ESB_MODE_PTX);
+                        if (err) {
+                                LOG_ERR("Failed to switch tag back to PTX: %d", err);
+                                break;
+                        }
+
+                        tag_state = SEND_TAG_DATA;
                         break;
 
                 default:

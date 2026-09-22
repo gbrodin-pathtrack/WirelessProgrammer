@@ -20,7 +20,6 @@ ESB_RECEIVED = 0x07
 # PC protocol states
 WAIT_FOR_PAIR_REQUEST = 0
 WAIT_FOR_DATA = 1
-TRANSFER_COMPLETE = 2
 
 def receive_packet(ser):
     """
@@ -82,6 +81,7 @@ def transmit_packet(ser, message_type, payload=b""):
     print("TX:", packet.hex(" ").upper())
 
 def main():
+    tagPacketCounter = 0
     print(f"Opening {SERIAL_PORT} at {BAUD_RATE} baud")
 
     with serial.Serial(
@@ -147,13 +147,9 @@ def main():
                 transmit_packet(ser, SERIAL_RECEIVED)
                 print("SERIAL_RECEIVED sent")
 
-                pc_state = TRANSFER_COMPLETE
-
-            elif pc_state == TRANSFER_COMPLETE:
-                print(
-                    f"Unexpected message after transfer completion: "
-                    f"0x{message_type:02X}"
-                )
+                pc_state = WAIT_FOR_DATA
+                tagPacketCounter += 1
+                print(f"{tagPacketCounter} Waiting for next tag data packet...")
 
 if __name__ == "__main__":
     main()
