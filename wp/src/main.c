@@ -5,7 +5,9 @@
 #include <esb.h> // ESB wireless communication library.
 #include <errno.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 #include <string.h>
+#include "serialMessages.h"
 
 LOG_MODULE_REGISTER(wireless_programmer, LOG_LEVEL_INF);
 
@@ -17,12 +19,6 @@ LOG_MODULE_REGISTER(wireless_programmer, LOG_LEVEL_INF);
 
 #define FEM_PDN_PIN 0
 
-/* Serial packet format:
-    Byte 0 = Header
-    Byte 1 = Message type
-    Byte 2 = Length
-    Byte 3+ = Payload
-*/
 /* ESB packet format:
     Byte 0 = Header
     Byte 1-2 = Sender ID
@@ -64,26 +60,23 @@ static const struct device *uart_dev = DEVICE_DT_GET(UART_NODE);
 // FEM PDN pin initialisation.
 static const struct device *gpio2_dev = DEVICE_DT_GET(DT_NODELABEL(gpio2));
 
-// Group of constants representing each serial receiver state.
-enum serial_rx_state {
-    WAIT_FOR_HEADER,
-    WAIT_FOR_MESSAGE_TYPE,
-    WAIT_FOR_LENGTH,
-    RECEIVE_PAYLOAD
-};
+static serialTXMessage_t serialTXBuffer;
+static serialRXMessage_t serialRXBuffer;
+K_MSGQ_DEFINE(serial_rx_queue, sizeof(uint8_t),
+             SERIAL_RX_MAX_PAYLOAD + sizeof(serialPacketHeader_t) + 2, 1);
+static atomic_t serial_rx_overflow;
 
 // Group of constants represetning each ESB receiver state.
 enum programmer_state {
-    WAIT_FOR_PC_PAIR_ACK,
+    DISCONNECTED,
     WAIT_FOR_TAG_PAIR,
     WAIT_FOR_TAG_DATA,
     RELAY_DATA_TO_PC,
-    WAIT_FOR_PC_RECEIVED,
     SEND_RECEIVED_TO_TAG,
     WAIT_FOR_RECEIVED_ACK,
     SWITCH_TO_RX
 };
-static volatile enum programmer_state programmer_state = WAIT_FOR_PC_PAIR_ACK;
+static volatile enum programmer_state programmer_state = DISCONNECTED;
 
 // ESB payloads.
 static struct esb_payload rx_payload;
@@ -95,7 +88,6 @@ static uint16_t active_tag_id = 0;
 static uint8_t tag_data[MAX_PAYLOAD_LEN];
 static uint8_t tag_data_length;
 // Persistent serial receive storage (Capacity bounded by Nordic's ESB packet limit).
-static uint8_t serial_rx_buffer[MAX_PAYLOAD_LEN];
 
 /*
     uint8 <--> uint16 conversion helpers.
@@ -113,144 +105,125 @@ static void write_u16(uint8_t *data, uint16_t value)
     data[1] = (uint8_t)value;
 }
 
+#if 0
+static void serial_transmit_raw(uint8_t* buffer, uint16_t len){
+    for (uint16_t i = 0; i < len; i++) {
+        uart_poll_out(uart_dev, buffer[i]);
+    }
+}
+#endif
+
 /*
     Serial packet transmission/reception helpers.
 */
-static void serial_transmit(uint8_t message_type, const uint8_t *payload, uint8_t length)
+static void serial_transmit_packet()
 {
-    // Transmit general information (header, message-type, length) over serial connection.
-    uart_poll_out(uart_dev, PROTOCOL_HEADER);
-    uart_poll_out(uart_dev, message_type);
-    uart_poll_out(uart_dev, length);
+    uint8_t checkA = 0;
+    uint8_t checkB = 0;
 
-    // Iterate over the prepared payload and transmit byte-by-byte.
-    for (uint8_t i=0; i < length; i++) {
-        uart_poll_out(uart_dev, payload[i]);
+    // calc checksum over payload
+    for(uint16_t i = sizeof(serialPacketHeader_t); i < serialTXBuffer.header.u16length + sizeof(serialPacketHeader_t); i++){
+        checkA += serialTXBuffer.blob[i];
+        checkB += checkA;
+    }
+
+    // add checksum to end of message
+    serialTXBuffer.blob[serialTXBuffer.header.u16length + sizeof(serialPacketHeader_t)] = checkA;
+    serialTXBuffer.blob[serialTXBuffer.header.u16length + sizeof(serialPacketHeader_t) + 1] = checkB;
+
+    // transmit message byte by byte
+    for (uint16_t i = 0; i < serialTXBuffer.header.u16length + sizeof(serialPacketHeader_t) + 2; i++) {
+        uart_poll_out(uart_dev, serialTXBuffer.blob[i]);
     }
 
     lastMessageTime = k_uptime_get_32();
 }
 
-static int serial_receive(uint8_t *message_type, uint8_t *payload, uint8_t *length)
+static void serial_rx_callback(const struct device *dev, void *user_data)
 {
-    enum serial_rx_state state = WAIT_FOR_HEADER; // Initial listening state.
-    uint8_t rx_byte; // Immediate storage location for incoming data.
-    uint8_t rx_index = 0; // Next available index of incoming payload byte.
-    uint8_t expected_length = 0; // Expected length based on the contents of the length byte.
-    uint16_t timeout_ms = 10000;
+    uint8_t rx_byte;
 
-    while (timeout_ms > 0) { // Only wait for a serial response until the timout is reached so not waiting forever.
-        // Attempt to read a character from the device and write at the address of rx_byte (0 if successful)
-        if (uart_poll_in(uart_dev, &rx_byte) == 0) {
+    ARG_UNUSED(user_data);
 
-            switch (state) {
-            case WAIT_FOR_HEADER: // System is initially waiting for a matching header byte to be received.
-                if (rx_byte == PROTOCOL_HEADER) {
-                        state = WAIT_FOR_MESSAGE_TYPE; // Switches to waiting for message-type byte if received PC byte matches the expected header.
-                }
-                break; // Exit to listen loop.
+    if (!uart_irq_update(dev) || !uart_irq_rx_ready(dev)) {
+        return;
+    }
 
-            case WAIT_FOR_MESSAGE_TYPE: // System is waiting for a message-type identifier byte .
-                *message_type = rx_byte;
-                state = WAIT_FOR_LENGTH; // Switches to next waiting for length byte.
-                break;
+    while (uart_fifo_read(dev, &rx_byte, 1) == 1) {
+        if (k_msgq_put(&serial_rx_queue, &rx_byte, K_NO_WAIT) != 0) {
+            atomic_set(&serial_rx_overflow, 1);
+        }
+    }
+}
 
-            case WAIT_FOR_LENGTH: // System is waiting for next byte representing expected payload length.
-                expected_length = rx_byte;
-                *length = expected_length;
-                rx_index = 0; // reset the buffer index from potential previous message.
+static bool serial_receive_packet(void)
+{
+    const uint32_t timeout_ms = 2000U;
+    uint32_t start_ms = k_uptime_get_32();
+    uint16_t msg_idx = 0;
+    uint16_t expected_len = 0;
+    uint8_t rx_byte;
 
-                if (expected_length == 0) { // If length is 0 then there is nothing further to expect (applies to pair requests and acknowledgements).
-                        return 0; // Successful exit from function.
-                }
-                state = RECEIVE_PAYLOAD; // Switches to receiving payload data for next expected_length bytes.
-                break;
+    while (true) {
+        uint32_t elapsed_ms = (uint32_t)(k_uptime_get_32() - start_ms);
 
-            case RECEIVE_PAYLOAD: // System is receiving payload bytes.
-                payload[rx_index++] = rx_byte; // Simultaneously add byte to buffer and increment rx_index.
-                if (rx_index >= expected_length) { // Stop adding data to rx_buffer if all expected bytes are received.
-                        return 0; // Successful exit from function.
-                }
-                break;
+        if (elapsed_ms >= timeout_ms) {
+            return false;
+        }
+
+        uint32_t remaining_ms = timeout_ms - elapsed_ms;
+
+        if (atomic_get(&serial_rx_overflow)) {
+            atomic_set(&serial_rx_overflow, 0);
+            k_msgq_purge(&serial_rx_queue);
+            LOG_WRN("Serial RX queue overflow");
+            return false;
+        }
+
+        if (k_msgq_get(&serial_rx_queue, &rx_byte, K_MSEC(remaining_ms)) != 0) {
+            return false;
+        }
+
+        if (msg_idx == 0) {
+            if (rx_byte == (SERIAL_RX_HEADER & 0xFF)) {
+                serialRXBuffer.blob[msg_idx++] = rx_byte;
             }
+            continue;
         }
-        k_sleep(K_MSEC(1)); // timeout for 1ms so not constantly hammering CPU while waiting for UART traffic
-        timeout_ms--;
+
+        if (msg_idx == 1) {
+            if (rx_byte == ((SERIAL_RX_HEADER >> 8) & 0xFF)) {
+                serialRXBuffer.blob[msg_idx++] = rx_byte;
+            } else {
+                msg_idx = (rx_byte == (SERIAL_RX_HEADER & 0xFF)) ? 1 : 0;
+            }
+            continue;
+        }
+
+        serialRXBuffer.blob[msg_idx++] = rx_byte;
+
+        if (msg_idx == sizeof(serialPacketHeader_t)) {
+            if (serialRXBuffer.header.u16length > SERIAL_RX_MAX_PAYLOAD) {
+                msg_idx = 0;
+                continue;
+            }
+            expected_len = serialRXBuffer.header.u16length + sizeof(serialPacketHeader_t) + 2;
+        }
+
+        if (expected_len != 0 && msg_idx == expected_len) {
+            uint8_t check_a = 0;
+            uint8_t check_b = 0;
+
+            for (uint16_t i = sizeof(serialPacketHeader_t);
+                 i < expected_len - 2; i++) {
+                check_a += serialRXBuffer.blob[i];
+                check_b += check_a;
+            }
+
+            return check_a == serialRXBuffer.blob[expected_len - 2] &&
+                   check_b == serialRXBuffer.blob[expected_len - 1];
+        }
     }
-    return -ETIMEDOUT; // Return timeout error if a full valid packet is never received.
-}
-
-/*
-    Serial event handler.
-*/
-static bool handle_serial_message(uint8_t message_type, const uint8_t *payload, uint8_t length)
-{
-    ARG_UNUSED(payload); // Disables warning since payload field is currently unused (may eventually need it if the PC were to ever start transmitting messages with a payload)
-
-    switch (programmer_state) {
-    case WAIT_FOR_PC_PAIR_ACK: // Wireless programmer is expecting an acknowledgement after it sends a serial pair request.
-        // Validating that the message-type identifier and payload length match the expected values for a serial pair acknowledgement.
-        if (message_type != SERIAL_PAIR_ACK) {
-            LOG_WRN("Expected SERIAL_PAIR_ACK, received 0x%02X", message_type);
-            return false;
-        }
-
-        if (length != 0) {
-            LOG_WRN("SERIAL_PAIR_ACK must have zero payload");
-            return false;
-        }
-
-        LOG_INF("PC pair acknowledgement received");
-        programmer_state = WAIT_FOR_TAG_PAIR; // Wireless programmer next expects a wireless pair request once serial connection is established (not handled in this function).
-        return true; // Boolean function returns true on successfu event completions.
-
-    case WAIT_FOR_PC_RECEIVED: // Wireless programmer expects a confirmation of reception once the tag data has been relayed to the PC.
-        // Validating type and payload length just as or the serial pair acknowledgement.
-        if (message_type != SERIAL_RECEIVED) {
-            LOG_WRN("Expected SERIAL_RECEIVED, received 0x%02X", message_type);
-            return false;
-        }
-
-        if (length != 0) { // Payload length is also expected to be 0 since this is essentially just a data acknowledgement.
-            LOG_WRN("SERIAL_RECEIVED must have zero payload");
-            return false;
-        }
-
-        LOG_INF("PC confirmed data received");
-        programmer_state = SEND_RECEIVED_TO_TAG; // Wireless programmer should next relay the 'received' message back to the tag once it is verified on serial-side.
-        return true;
-
-    default: // Default case for unexpected messages beyond the discussed protocol states.
-        LOG_WRN("Unexpeted serial message 0x%02X in programmer state %d", message_type, programmer_state);
-        return false;
-    }
-}
-
-/*
-    Use-case of serial functions to establish serial connection between the WP and PC with acknowledgements.
-*/
-static int serial_pair_with_pc(void)
-{
-    int err;
-    uint8_t message_type;
-    uint8_t length;
-
-    LOG_INF("Sending PC pair request");
-
-    serial_transmit(SERIAL_PAIR_REQUEST, NULL, 0); // Transmit a message of type 'serial pair request' (request doesn't have a payload).
-
-    err = serial_receive(&message_type, serial_rx_buffer, &length); // Function writes message type and length to the local variable addresses.
-    if (err) {
-        LOG_ERR("No serial response received %d", err);
-        return err;
-    }
-
-    if (!handle_serial_message(message_type, serial_rx_buffer, length)) { // Validates received packet against constraints imposed at current internal state (WAIT_FOR_PC_PAIR_ACK).
-        LOG_ERR("Invalid response to serial pair request");
-        return -EPROTO; // Protocol error code.
-    }
-
-    return 0;
 }
 
 /*
@@ -588,6 +561,8 @@ static int esb_switch_mode(enum esb_mode current_mode, enum esb_mode new_mode)
 */
 int main(void)
 {
+    serialTXBuffer.header.u16header = SERIAL_TX_HEADER;
+
     int err;
 
     LOG_INF("Wireless programmer starting");
@@ -598,13 +573,12 @@ int main(void)
         return 0; // Exit if there is an error with the device.
     }
 
-    // Establish wired connection to PC.
-    err = serial_pair_with_pc();
+    err = uart_irq_callback_user_data_set(uart_dev, serial_rx_callback, NULL);
     if (err) {
-        LOG_ERR("PC pairing failed: %d", err);
+        LOG_ERR("Failed to install UART RX callback: %d", err);
         return 0;
     }
-    LOG_INF("PC paired successfully");
+    uart_irq_rx_enable(uart_dev);
 
     // Enable the FEM by manually activating the PDN pin.
     err = fem_pdn_init();
@@ -624,10 +598,45 @@ int main(void)
     // Keep looping over this logic.
     while (1){
         switch (programmer_state) {
+        case DISCONNECTED:
+            k_sleep(K_MSEC(1000)); //attempt connection only every second
+            serialTXBuffer.header.u16messageType = SERIAL_TX_PAIR_REQUEST;
+            serialTXBuffer.header.u16length = SERIAL_TX_PAIR_REQUEST_LEN;
+            serialTXBuffer.pairRequest.u8devType = 1;
+
+            serial_transmit_packet();
+
+            if(!serial_receive_packet() ||
+                serialRXBuffer.header.u16messageType != SERIAL_RX_PAIR_REQUEST_ACK){
+                break;
+            }
+
+            serialTXBuffer.header.u16messageType = SERIAL_TX_FW_INFO;
+            serialTXBuffer.header.u16length = SERIAL_TX_FW_INFO_LEN;
+            serialTXBuffer.fwInfo.u32gitRev = 0x12345678;
+            serialTXBuffer.fwInfo.u8protocolVer = 0;
+
+            serial_transmit_packet();
+            
+            if(!serial_receive_packet() ||
+                serialRXBuffer.header.u16messageType != SERIAL_RX_FW_INFO_ACK ||
+                serialRXBuffer.fwInfoAck.u8status != 0){
+                break;
+            }
+            programmer_state = WAIT_FOR_TAG_PAIR;
+            break;
         case WAIT_FOR_TAG_PAIR:
         case WAIT_FOR_TAG_DATA:
             if(k_uptime_get_32() - lastMessageTime > KEEP_ALVIE_INTERVAL_MS){
-                serial_transmit(KEEP_ALIVE, NULL, 0);
+                serialTXBuffer.header.u16messageType = SERIAL_TX_KEEP_ALIVE;
+                serialTXBuffer.header.u16length = SERIAL_TX_KEEP_ALIVE_LEN;
+
+                serial_transmit_packet();
+
+                if(!serial_receive_packet() || serialRXBuffer.header.u16messageType != SERIAL_RX_KEEP_ALIVE_ACK){
+                    programmer_state = DISCONNECTED;
+                    break;
+                }
                 LOG_DBG("KEEP_ALIVE sent");
             }
             break;
@@ -636,25 +645,18 @@ int main(void)
 
         case RELAY_DATA_TO_PC: // Received tag data needs to be relayed to the PC over serial connection,
             LOG_INF("Relaying tag data to PC");
-            serial_transmit(SERIAL_DATA, tag_data, tag_data_length); // Transmit a serial message of type 'SERIAL_DATA' containing the transmitted tag data.
-            programmer_state = WAIT_FOR_PC_RECEIVED; // Transition to waiting for confirmation of received data from the PC.
-            break;
+            serialTXBuffer.header.u16messageType = SERIAL_TX_TAG_DATA;
+            serialTXBuffer.header.u16length = tag_data_length;
+            memcpy(serialTXBuffer.tagData.payload, tag_data, tag_data_length);
 
-        case WAIT_FOR_PC_RECEIVED: { // Wireless programmer is receiving the confirmation of relayed data arrival.
-            uint8_t message_type;
-            uint8_t length;
-
-            err = serial_receive(&message_type, serial_rx_buffer, &length); // Receive incoming serial packet and locally store its content and information.
-            if (err) {
-                LOG_WRN("No PC receive confirmation: %d", err);
-                break; // Stay in the same state and continue waiting if nothing received.
+            serial_transmit_packet();
+            if(!serial_receive_packet() || serialRXBuffer.header.u16messageType != SERIAL_RX_TAG_DATA_ACK){
+                programmer_state = DISCONNECTED;
+                break;
             }
 
-            if (!handle_serial_message(message_type, serial_rx_buffer, length)) { // Handle the packet according to the expected message-type in this state.
-                LOG_WRN("Invalid PC response");
-            }
+            programmer_state = SEND_RECEIVED_TO_TAG;
             break;
-        }
 
         case SEND_RECEIVED_TO_TAG: // The PC data acknowledgement needs to be relayed back to the tag.
             err = esb_switch_mode(ESB_MODE_PRX, ESB_MODE_PTX); // Switch the wireless programmer into ESB TX mode.
