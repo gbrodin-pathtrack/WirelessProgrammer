@@ -3,7 +3,7 @@ import serial
 # Serial configuration
 SERIAL_PORT = "COM6"
 BAUD_RATE = 115200
-TIMEOUT_S = 1
+TIMEOUT_S = 2
 
 # Protocol definitions
 PROTOCOL_HEADER = 0xAA
@@ -16,6 +16,7 @@ ESB_DATA = 0x04
 SERIAL_DATA = 0x05
 SERIAL_RECEIVED = 0x06
 ESB_RECEIVED = 0x07
+KEEP_ALIVE = 0x08
 
 # PC protocol states
 WAIT_FOR_PAIR_REQUEST = 0
@@ -96,6 +97,7 @@ def main():
             packet = receive_packet(ser)
 
             if packet is None:
+                pc_state = WAIT_FOR_PAIR_REQUEST
                 continue
 
             message_type, payload = packet
@@ -134,11 +136,16 @@ def main():
                 print("Waiting for tag data...")
 
             elif pc_state == WAIT_FOR_DATA:
+                if message_type == KEEP_ALIVE:
+                    print("Got keep alive")
+                    continue
+
                 if message_type != SERIAL_DATA:
                     print(
-                        f"Expected SERIAL_DATA, received "
+                        f"Expected KEEP_ALIVE or SERIAL_DATA, received "
                         f"0x{message_type:02X}"
                     )
+                    pc_state = WAIT_FOR_PAIR_REQUEST
                     continue
 
                 print("DATA reeived from tag")

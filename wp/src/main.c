@@ -47,8 +47,12 @@ LOG_MODULE_REGISTER(wireless_programmer, LOG_LEVEL_INF);
 #define SERIAL_DATA             0x05
 #define SERIAL_RECEIVED         0x06
 #define ESB_RECEIVED            0x07
+#define KEEP_ALIVE              0x08
 
 #define WIRELESS_HEADER_LEN 7
+
+#define KEEP_ALVIE_INTERVAL_MS  1000
+static volatile uint32_t lastMessageTime;
 
 // Configure ESB ddress for pipes.
 static const uint8_t base_addr_0[4] = {0xE7, 0xE7, 0xE7, 0xE7}; // Pipe 0 is unique because it handles ACK transmission.
@@ -124,6 +128,8 @@ static void serial_transmit(uint8_t message_type, const uint8_t *payload, uint8_
         for (uint8_t i=0; i < length; i++) {
                 uart_poll_out(uart_dev, payload[i]);
         }
+
+        lastMessageTime = k_uptime_get_32();
 }
 
 static int serial_receive(uint8_t *message_type, uint8_t *payload, uint8_t *length)
@@ -621,6 +627,11 @@ int main(void)
                 switch (programmer_state) {
                 case WAIT_FOR_TAG_PAIR:
                 case WAIT_FOR_TAG_DATA:
+                        if(k_uptime_get_32() - lastMessageTime > KEEP_ALVIE_INTERVAL_MS){
+                                serial_transmit(KEEP_ALIVE, NULL, 0);
+                                LOG_DBG("KEEP_ALIVE sent");
+                        }
+                        break;
                 case WAIT_FOR_RECEIVED_ACK:
                         break; // These states advance from ESB events.
 
