@@ -2,7 +2,7 @@ import serial
 
 # Serial configuration
 SERIAL_PORT = "COM6"
-BAUD_RATE = 115200
+BAUD_RATE = 57600
 TIMEOUT_S = 2
 
 # The bridge sends 16-bit header, type and payload length fields in little-endian order.
@@ -30,11 +30,11 @@ WAIT_FOR_FW_INFO = 1
 WAIT_FOR_DATA = 2
 
 
-def payload_checksum(payload):
-    """The bridge's two running 8-bit sums cover only the payload."""
+def packet_checksum(packet_data):
+    """Calculate the two running 8-bit sums over header and payload."""
     check_a = 0
     check_b = 0
-    for byte in payload:
+    for byte in packet_data:
         check_a = (check_a + byte) & 0xFF
         check_b = (check_b + check_a) & 0xFF
     return bytes((check_a, check_b))
@@ -80,8 +80,8 @@ def receive_packet(ser):
         return None
 
     payload = tail[:-CHECKSUM_SIZE]
-    if tail[-CHECKSUM_SIZE:] != payload_checksum(payload):
-        print("Invalid serial payload checksum")
+    if tail[-CHECKSUM_SIZE:] != packet_checksum(BRIDGE_HEADER + fields + payload):
+        print("Invalid serial packet checksum")
         return None
 
     return message_type, payload, BRIDGE_HEADER + fields + tail
@@ -92,13 +92,13 @@ def transmit_packet(ser, message_type, payload=b""):
     if len(payload) > MAX_PAYLOAD_LEN:
         raise ValueError("Payload cannot exceed 1024 bytes")
 
-    packet = (
+    packet_data = (
         PC_HEADER
         + message_type.to_bytes(2, "little")
         + len(payload).to_bytes(2, "little")
         + payload
-        + payload_checksum(payload)
     )
+    packet = packet_data + packet_checksum(packet_data)
 
     ser.write(packet)
     ser.flush()

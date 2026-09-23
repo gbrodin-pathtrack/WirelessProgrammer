@@ -46,7 +46,7 @@ LOG_MODULE_REGISTER(wireless_programmer, LOG_LEVEL_INF);
 
 #define WIRELESS_HEADER_LEN 7
 
-#define KEEP_ALVIE_INTERVAL_MS  1000
+#define KEEP_ALVIE_INTERVAL_MS  2000
 static volatile uint32_t lastMessageTime;
 
 // Configure ESB ddress for pipes.
@@ -121,8 +121,8 @@ static void serial_transmit_packet()
     uint8_t checkA = 0;
     uint8_t checkB = 0;
 
-    // calc checksum over payload
-    for(uint16_t i = sizeof(serialPacketHeader_t); i < serialTXBuffer.header.u16length + sizeof(serialPacketHeader_t); i++){
+    // calc checksum over the six-byte header and payload
+    for(uint16_t i = 0; i < serialTXBuffer.header.u16length + sizeof(serialPacketHeader_t); i++){
         checkA += serialTXBuffer.blob[i];
         checkB += checkA;
     }
@@ -214,7 +214,7 @@ static bool serial_receive_packet(void)
             uint8_t check_a = 0;
             uint8_t check_b = 0;
 
-            for (uint16_t i = sizeof(serialPacketHeader_t);
+            for (uint16_t i = 0;
                  i < expected_len - 2; i++) {
                 check_a += serialRXBuffer.blob[i];
                 check_b += check_a;
