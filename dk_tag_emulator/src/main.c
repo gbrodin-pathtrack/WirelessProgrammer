@@ -5,8 +5,8 @@
 
 LOG_MODULE_REGISTER(esb_tx, LOG_LEVEL_INF); // Enable logging over the connected COM port.
 
-// Packet constraint information (value based on Nordic ESB limit)
-#define MAX_PAYLOAD_LEN 252
+// Packet constraint information (ESB limit set in prj.conf, which must match the other device).
+#define MAX_PAYLOAD_LEN CONFIG_ESB_MAX_PAYLOAD_LENGTH
 
 /* ESB packet structure:
     Byte 0 = Header
@@ -34,9 +34,21 @@ LOG_MODULE_REGISTER(esb_tx, LOG_LEVEL_INF); // Enable logging over the connected
 
 #define WIRELESS_HEADER_LEN     7
 
-static const uint8_t base_addr_0[4] = {0xE7, 0xE7, 0xE7, 0xE7}; // Pipe 0 address.
-static const uint8_t base_addr_1[4] = {0xC2, 0xC2, 0xC2, 0xC2}; // Pipe 1-7 addresses.
-static const uint8_t addr_prefix[8] = {0xE7, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8}; // Address prefixes for pipe 0-7.
+// Radio settings must match the other device (wp, NMini radio_profile.c/h).
+#define RF_CHANNEL              23      // 2423 MHz: between Wi-Fi channels 1 and 6, clear of BLE advertising channel 38 (2426 MHz).
+#define RETRANSMIT_COUNT        3
+#define RETRANSMIT_DELAY_US     5000
+
+// ESB raises RX_RECEIVED before the ACK is on air, so stay in PRX this long before switching away to let every
+// retransmission be ACKed.
+#define ACK_GRACE_MS            ((RETRANSMIT_COUNT * RETRANSMIT_DELAY_US) / 1000 + 1)
+
+// Longer than the programmer's 2 s wait for the PC's acknowledgement.
+#define PC_RECEIVED_TIMEOUT_MS  3000
+
+// ESB address for pipe 0, the only pipe used. 0xE7 rather than 0xA_ bytes so the address doesn't continue the preamble's alternating 1010 pattern.
+static const uint8_t base_addr_0[4] = {0xE7, 0xE7, 0xE7, 0xE7};
+static const uint8_t addr_prefix[1] = {0xE7};
 
 // Tag state machine.
 enum tag_state {
@@ -50,6 +62,7 @@ enum tag_state {
 };
 
 static volatile enum tag_state tag_state = SEND_PROGRAMMER_PAIR;
+static uint32_t received_wait_start_ms;
 
 // ESB payloads.
 static struct esb_payload rx_payload;
@@ -224,6 +237,20 @@ static void handle_tx_failed(const struct esb_evt *event)
     if (err) {
         LOG_ERR("esb_pop_tx failed: %d", err);
     }
+
+    // Retry rather than waiting forever for an ACK that will never arrive.
+    switch (tag_state) {
+    case WAIT_FOR_PAIR_ACK:
+        tag_state = SEND_PROGRAMMER_PAIR;
+        break;
+
+    case WAIT_FOR_DATA_ACK:
+        tag_state = SEND_TAG_DATA;
+        break;
+
+    default:
+        break;
+    }
 }
 
 /*
@@ -262,6 +289,9 @@ static int esb_radio_init(enum esb_mode mode)
     config.mode = mode;
     config.event_handler = esb_eventhandler; // Manually link event handling function.
     config.selective_auto_ack = true; // Every packet transmitted requires acknowledgement
+    config.bitrate = ESB_BITRATE_4MBPS;
+    config.retransmit_count = RETRANSMIT_COUNT;
+    config.retransmit_delay = RETRANSMIT_DELAY_US;
 
     err = esb_init(&config); // Initialise ESB module.
     if (err) {
@@ -275,19 +305,13 @@ static int esb_radio_init(enum esb_mode mode)
         return err;
     }
 
-    err = esb_set_base_address_1(base_addr_1); // Set base address of pipe 1-7.
-    if (err) {
-        LOG_ERR("base address 1 failed: %d", err);
-        return err;
-    }
-
-    err = esb_set_prefixes(addr_prefix, ARRAY_SIZE(addr_prefix)); // Attach unique prefixes to each pipe address.
+    err = esb_set_prefixes(addr_prefix, ARRAY_SIZE(addr_prefix)); // Single prefix, so only pipe 0 is enabled.
     if (err) {
         LOG_ERR("prefix configuration failed: %d", err);
         return err;
     }
 
-    err = esb_set_rf_channel(40); // Set RF channel to match protocol standard.
+    err = esb_set_rf_channel(RF_CHANNEL);
     if (err) {
         LOG_ERR("Failed to set RF channel: %d", err);
         return err;
@@ -351,6 +375,7 @@ int main(void)
     while (1) {
         switch(tag_state) {
         case SEND_PROGRAMMER_PAIR: // Initial state where tag requests a paired connection with the wireless programmer.
+            k_sleep(K_SECONDS(1)); // Pace pairing retries so the tag does not spam the programmer.
             err = send_pair_request(); // Call pair-request function.
             if (err) {
                 LOG_ERR("Failed to send pair request: %d", err);
@@ -386,15 +411,29 @@ int main(void)
                 break;
             }
 
+            received_wait_start_ms = k_uptime_get_32();
             tag_state = WAIT_FOR_PC_RECEIVED; // Transition to state awaiting data confirmation from the PC.
             LOG_INF("Waiting for programmer RECEIVED message");
             break;
 
         case WAIT_FOR_PC_RECEIVED:
-            // Also handled by ESB event-handler.
+            // Advanced by the ESB event handler. If the programmer never confirms, it may have lost the PC or
+            // the session, so re-pair rather than waiting forever.
+            if (k_uptime_get_32() - received_wait_start_ms > PC_RECEIVED_TIMEOUT_MS) {
+                LOG_WRN("No RECEIVED from programmer, re-pairing");
+
+                err = esb_switch_mode(ESB_MODE_PRX, ESB_MODE_PTX);
+                if (err) {
+                    LOG_ERR("Failed to switch tag back to PTX: %d", err);
+                    break;
+                }
+
+                tag_state = SEND_PROGRAMMER_PAIR;
+            }
             break;
 
         case SWITCH_TO_TX:
+            k_sleep(K_MSEC(ACK_GRACE_MS)); // Let the ACK for the RECEIVED message (and any retransmissions) go out first.
             LOG_INF("Switching tag back to PTX for the next transfer");
 
             err = esb_switch_mode(ESB_MODE_PRX, ESB_MODE_PTX);

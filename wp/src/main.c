@@ -14,8 +14,8 @@ LOG_MODULE_REGISTER(wireless_programmer, LOG_LEVEL_INF);
 // Get node identifier for a /chosen node property.
 #define UART_NODE DT_NODELABEL(uart20)
 
-// Packet constraint information (value based on Nordic ESB limit)
-#define MAX_PAYLOAD_LEN 252
+// Packet constraint information (ESB limit set in prj.conf, which must match the other device).
+#define MAX_PAYLOAD_LEN CONFIG_ESB_MAX_PAYLOAD_LENGTH
 
 #define FEM_PDN_PIN 0
 
@@ -49,10 +49,18 @@ LOG_MODULE_REGISTER(wireless_programmer, LOG_LEVEL_INF);
 #define KEEP_ALVIE_INTERVAL_MS  2000
 static volatile uint32_t lastMessageTime;
 
-// Configure ESB ddress for pipes.
-static const uint8_t base_addr_0[4] = {0xE7, 0xE7, 0xE7, 0xE7}; // Pipe 0 is unique because it handles ACK transmission.
-static const uint8_t base_addr_1[4] = {0xC2, 0xC2, 0xC2, 0xC2}; // General-use address for pipes 1-7.
-static const uint8_t addr_prefix[8] = {0xE7, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8}; // Address prefixes to give each pipe a unique identifier (one for pipe 0-7).
+// Radio settings must match the other device (dk_tag_emulator, NMini radio_profile.c/h).
+#define RF_CHANNEL              23      // 2423 MHz: between Wi-Fi channels 1 and 6, clear of BLE advertising channel 38 (2426 MHz).
+#define RETRANSMIT_COUNT        3
+#define RETRANSMIT_DELAY_US     5000
+
+// ESB raises RX_RECEIVED before the ACK is on air, so stay in PRX this long before switching away to let every
+// retransmission be ACKed.
+#define ACK_GRACE_MS            ((RETRANSMIT_COUNT * RETRANSMIT_DELAY_US) / 1000 + 1)
+
+// ESB address for pipe 0, the only pipe used. 0xE7 rather than 0xA_ bytes so the address doesn't continue the preamble's alternating 1010 pattern.
+static const uint8_t base_addr_0[4] = {0xE7, 0xE7, 0xE7, 0xE7};
+static const uint8_t addr_prefix[1] = {0xE7};
 
 // Get device reference from a devicetree node identifier.
 static const struct device *uart_dev = DEVICE_DT_GET(UART_NODE);
@@ -450,6 +458,11 @@ static void handle_tx_failed(const struct esb_evt *event)
     if (err) {
         LOG_ERR("esb_pop_tx failed: %d", err);
     }
+
+    // The tag times out and re-pairs if it misses RECEIVED, so return to PRX rather than waiting forever.
+    if (programmer_state == WAIT_FOR_RECEIVED_ACK) {
+        programmer_state = SWITCH_TO_RX;
+    }
 }
 
 /*
@@ -485,6 +498,9 @@ static int esb_radio_init(enum esb_mode mode)
     config.mode = mode;
     config.event_handler = esb_eventhandler; // Manually link event handling function.
     config.selective_auto_ack = true; // Every packet transmitted requires acknowledgement
+    config.bitrate = ESB_BITRATE_4MBPS;
+    config.retransmit_count = RETRANSMIT_COUNT;
+    config.retransmit_delay = RETRANSMIT_DELAY_US;
 
     err = esb_init(&config); // Initialise ESB module.
     if (err) {
@@ -498,20 +514,13 @@ static int esb_radio_init(enum esb_mode mode)
         return err;
     }
 
-    err = esb_set_base_address_1(base_addr_1); // Set base address of pipe 1-7.
-    if (err) {
-        LOG_ERR("base address 1 failed: %d", err);
-        return err;
-    }
-
-    err = esb_set_prefixes(addr_prefix, ARRAY_SIZE(addr_prefix)); // Attach unique prefixes to each pipe address.
+    err = esb_set_prefixes(addr_prefix, ARRAY_SIZE(addr_prefix)); // Single prefix, so only pipe 0 is enabled.
     if (err) {
         LOG_ERR("prefix configuration failed: %d", err);
         return err;
     }
 
-    // Pick an RF channel. ESB channel 40 corresponds to 2400MHz + 40 MHz = 2440MHz (receiver must be the same).
-    err = esb_set_rf_channel(40); // Set RF channel to match protocol standard.
+    err = esb_set_rf_channel(RF_CHANNEL);
     if (err) {
         LOG_ERR("Failed to set RF channel: %d", err);
         return err;
@@ -659,6 +668,8 @@ int main(void)
             break;
 
         case SEND_RECEIVED_TO_TAG: // The PC data acknowledgement needs to be relayed back to the tag.
+            // The serial relay normally takes longer than this, but don't rely on it to protect the tag data's ACK.
+            k_sleep(K_MSEC(ACK_GRACE_MS));
             err = esb_switch_mode(ESB_MODE_PRX, ESB_MODE_PTX); // Switch the wireless programmer into ESB TX mode.
             if (err) {
                 LOG_ERR("Failed to switch ESB to PTX: %d", err);
