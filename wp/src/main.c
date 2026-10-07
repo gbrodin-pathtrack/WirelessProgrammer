@@ -2,54 +2,50 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/hwinfo.h>
+#include <zephyr/sys/byteorder.h>
 #include <esb.h> // ESB wireless communication library.
 #include <errno.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
 #include <string.h>
 #include "serialMessages.h"
+#include "UHFMessages.h"
 
 LOG_MODULE_REGISTER(wireless_programmer, LOG_LEVEL_INF);
 
 // Get node identifier for a /chosen node property.
 #define UART_NODE DT_NODELABEL(uart20)
 
-// Packet constraint information (ESB limit set in prj.conf, which must match the other device).
-#define MAX_PAYLOAD_LEN CONFIG_ESB_MAX_PAYLOAD_LENGTH
-
 #define FEM_PDN_PIN 0
 
-/* ESB packet format:
-    Byte 0 = Header
-    Byte 1-2 = Sender ID
-    Byte 3-4 = Receiver ID
-    Byte 5 = Message type
-    Byte 6 = Length
-    Byte 7+ = Payload
-*/
+// Base station ID sent to the tag, which addresses its messages to it. Taken from the SoC's factory device ID so
+// every programmer is different.
+static uint32_t programmer_id;
 
-// constant protocol header for testing.
-#define PROTOCOL_HEADER 0xAA
+// PAIR_ACK status.
+#define PAIR_STATUS_HOST_PRESENT    0
+#define PAIR_STATUS_NO_HOST         1
 
-// ID structure. leftmost 4 bits are the device-type, remaining 12 are the device number.
-#define PROGRAMMER_ID   0x2001
+// Largest PicoFix radio packet (the CC1120 fast-mode limit), so pass-through chunks carry 90 bytes.
+#define PICOFIX_MAX_PACKET          104
+#define PASSTHROUGH_CHUNK_LEN       (PICOFIX_MAX_PACKET - sizeof(picofix32UHFHeader_t))
 
-// Message types:
-#define SERIAL_PAIR_REQUEST     0x01
-#define SERIAL_PAIR_ACK         0x02
-#define ESB_PAIR_REQUEST        0x03
-#define ESB_DATA                0x04
-#define SERIAL_DATA             0x05
-#define SERIAL_RECEIVED         0x06
-#define ESB_RECEIVED            0x07
-#define KEEP_ALIVE              0x08
+// Matches the tag's pass-through prep buffer (SCRATCH_UHF_PREP).
+#define TAG_MESSAGE_MAX_LEN         1408
 
-#define WIRELESS_HEADER_LEN 7
+#define TAG_MESSAGE_TIMEOUT_MS      5000    // The tag pings roughly every 2 s, and waits 1 s after PAIR_ACK before its first message.
+#define TAG_CHUNK_TIMEOUT_MS        1000
+#define TAG_CONT_ACK_TIMEOUT_MS     1000
+#define PC_REPLY_TIMEOUT_MS         800     // The tag only listens for 1 s after sending, so a later reply is useless.
+#define PC_LINK_TIMEOUT_MS          2000
+#define ESB_TX_TIMEOUT_MS           100     // Covers every retransmission.
+#define IDLE_SERVICE_SLICE_MS       10      // How often blocking waits answer PAIR_INIT.
 
 #define KEEP_ALVIE_INTERVAL_MS  2000
 static volatile uint32_t lastMessageTime;
 
-// Radio settings must match the other device (dk_tag_emulator, NMini radio_profile.c/h).
+// Radio settings must match the other device
 #define RF_CHANNEL              23      // 2423 MHz: between Wi-Fi channels 1 and 6, clear of BLE advertising channel 38 (2426 MHz).
 #define RETRANSMIT_COUNT        3
 #define RETRANSMIT_DELAY_US     5000
@@ -74,56 +70,64 @@ K_MSGQ_DEFINE(serial_rx_queue, sizeof(uint8_t),
              SERIAL_RX_MAX_PAYLOAD + sizeof(serialPacketHeader_t) + 2, 1);
 static atomic_t serial_rx_overflow;
 
-// Group of constants represetning each ESB receiver state.
+// Received radio packets, drained from the ESB event handler. Deep enough to hold a tag's back-to-back chunks.
+K_MSGQ_DEFINE(radio_rx_queue, sizeof(struct esb_payload), 16, 1);
+static K_SEM_DEFINE(tx_done_sem, 0, 1);
+static volatile bool tx_ok;
+
 enum programmer_state {
-    DISCONNECTED,
-    WAIT_FOR_TAG_PAIR,
-    WAIT_FOR_TAG_DATA,
-    RELAY_DATA_TO_PC,
-    SEND_RECEIVED_TO_TAG,
-    WAIT_FOR_RECEIVED_ACK,
-    SWITCH_TO_RX
+    DISCONNECTED,       // No PC link.
+    WAIT_FOR_TAG_PAIR,  // PC connected, waiting for a tag's PAIR_INIT.
+    TAG_SESSION         // Passing messages between the paired tag and the PC.
 };
 static volatile enum programmer_state programmer_state = DISCONNECTED;
 
-// ESB payloads.
-static struct esb_payload rx_payload;
-static struct esb_payload tx_payload;
+// Set once a tag has been sent PAIR_ACK, so its following packets are left queued for the session.
+static bool session_pending;
+static uint32_t session_tag_id;
 
-// global session information about tag.
-static uint16_t active_tag_id = 0;
-// Persistent application payload storage.
-static uint8_t tag_data[MAX_PAYLOAD_LEN];
-static uint8_t tag_data_length;
-// Persistent serial receive storage (Capacity bounded by Nordic's ESB packet limit).
+// The tag's current pass-through message, assembled from its chunks.
+static uint8_t tag_message[TAG_MESSAGE_MAX_LEN];
+
+static void service_radio_idle(void);
 
 /*
-    uint8 <--> uint16 conversion helpers.
+    PicoFix CRC: two running sums over everything after the tag byte and the CRC itself, stored in bytes 1 and 2.
 */
-static uint16_t read_u16(const uint8_t *data)
+static void picofix_calculate_crc(uint8_t *message, uint16_t length)
 {
-    // Left-shift the first byte and append it to the second.
-    return ((uint16_t)data[0] << 8 | data[1]);
-}
-
-static void write_u16(uint8_t *data, uint16_t value)
-{
-    // extract the first and second byte from the data and sore them as separate uint8's.
-    data[0] = (uint8_t)(value >> 8); // Right-shift removes scaling.
-    data[1] = (uint8_t)value;
-}
-
-#if 0
-static void serial_transmit_raw(uint8_t* buffer, uint16_t len){
-    for (uint16_t i = 0; i < len; i++) {
-        uart_poll_out(uart_dev, buffer[i]);
+    message[1] = 0;
+    message[2] = 0;
+    for (uint16_t i = 3; i < length; i++) {
+        message[1] += message[i];
+        message[2] += message[1];
     }
 }
-#endif
+
+static bool picofix_crc_ok(const uint8_t *message, uint16_t length)
+{
+    uint8_t check_a = 0;
+    uint8_t check_b = 0;
+
+    for (uint16_t i = 3; i < length; i++) {
+        check_a += message[i];
+        check_b += check_a;
+    }
+    return check_a == message[1] && check_b == message[2];
+}
 
 /*
     Serial packet transmission/reception helpers.
 */
+static void serial_transmit_raw(const uint8_t *buffer, uint16_t len)
+{
+    for (uint16_t i = 0; i < len; i++) {
+        uart_poll_out(uart_dev, buffer[i]);
+    }
+
+    lastMessageTime = k_uptime_get_32();
+}
+
 static void serial_transmit_packet()
 {
     uint8_t checkA = 0;
@@ -139,12 +143,7 @@ static void serial_transmit_packet()
     serialTXBuffer.blob[serialTXBuffer.header.u16length + sizeof(serialPacketHeader_t)] = checkA;
     serialTXBuffer.blob[serialTXBuffer.header.u16length + sizeof(serialPacketHeader_t) + 1] = checkB;
 
-    // transmit message byte by byte
-    for (uint16_t i = 0; i < serialTXBuffer.header.u16length + sizeof(serialPacketHeader_t) + 2; i++) {
-        uart_poll_out(uart_dev, serialTXBuffer.blob[i]);
-    }
-
-    lastMessageTime = k_uptime_get_32();
+    serial_transmit_raw(serialTXBuffer.blob, serialTXBuffer.header.u16length + sizeof(serialPacketHeader_t) + 2);
 }
 
 static void serial_rx_callback(const struct device *dev, void *user_data)
@@ -164,9 +163,8 @@ static void serial_rx_callback(const struct device *dev, void *user_data)
     }
 }
 
-static bool serial_receive_packet(void)
+static bool serial_receive_packet(uint32_t timeout_ms)
 {
-    const uint32_t timeout_ms = 2000U;
     uint32_t start_ms = k_uptime_get_32();
     uint16_t msg_idx = 0;
     uint16_t expected_len = 0;
@@ -188,8 +186,10 @@ static bool serial_receive_packet(void)
             return false;
         }
 
-        if (k_msgq_get(&serial_rx_queue, &rx_byte, K_MSEC(remaining_ms)) != 0) {
-            return false;
+        // Wait in short slices so a tag's PAIR_INIT is still answered while the PC is slow to reply.
+        if (k_msgq_get(&serial_rx_queue, &rx_byte, K_MSEC(MIN(remaining_ms, IDLE_SERVICE_SLICE_MS))) != 0) {
+            service_radio_idle();
+            continue;
         }
 
         if (msg_idx == 0) {
@@ -235,161 +235,6 @@ static bool serial_receive_packet(void)
 }
 
 /*
-        ESB RX packet handling helpers.
-*/
-static bool validate_pair_request(const struct esb_payload *packet)
-{
-    // Packet is invalid if it doesn't contain the required information from the header for a pair request (7 bytes).
-    if (packet->length != WIRELESS_HEADER_LEN) {
-        LOG_WRN("Wireless payload length mismatch");
-        return false;
-    }
-
-    // Extract header information from the packet.
-    uint8_t header = packet->data[0];
-    uint16_t sender_id = read_u16(&packet->data[1]);
-    uint16_t receiver_id = read_u16(&packet->data[3]);
-    uint8_t message_type = packet->data[5];
-    uint8_t payload_length = packet->data[6];
-
-    // Validity checks.
-    if (header != PROTOCOL_HEADER) { // Header must match expected value (0xAA).
-        LOG_WRN("Invalid wireless header");
-        return false;
-    }
-
-    if (sender_id == PROGRAMMER_ID) { // Sender cannot claim to have the ID used by this device.
-        LOG_WRN("Sender ID cannot belong to current device");
-        return false;
-    }
-
-    if (receiver_id != PROGRAMMER_ID) { // Pair request must be addressed to the current device.
-        LOG_WRN("Unexpected receiver ID: 0x%04X", receiver_id);
-        return false;
-    }
-
-    if (message_type != ESB_PAIR_REQUEST) { // Pair request must have correct type.
-        LOG_WRN("Unexpected wireless message type: 0x%02X", message_type);
-        return false;
-    }
-
-    if (payload_length != 0) { // Pair request payload must be empty.
-        LOG_WRN("Wireless data length mismatch");
-        return false;
-    }
-
-    return true;
-}
-
-static bool validate_esb_packet(const struct esb_payload *packet, uint16_t expected_sender, uint16_t expected_receiver, uint8_t expected_type)
-{
-    // Packet is invalid if it doesn't contain the minimum required information from the header (7 bytes).
-    if (packet->length < WIRELESS_HEADER_LEN) {
-        LOG_WRN("ESB packet too short: %u", packet->length);
-        return false;
-    }
-
-    // Extract header information from the packet.
-    uint8_t header = packet->data[0];
-    uint16_t sender_id = read_u16(&packet->data[1]);
-    uint16_t receiver_id = read_u16(&packet->data[3]);
-    uint8_t message_type = packet->data[5];
-    uint8_t payload_length = packet->data[6];
-
-    // Validity checks.
-    if (header != PROTOCOL_HEADER) { // Header must match expected value (0xAA).
-        LOG_WRN("Invalid wireless header");
-        return false;
-    }
-
-    if (sender_id != expected_sender) {
-        LOG_WRN("Unexpected sender ID: 0x%04X", sender_id);
-        return false;
-    }
-
-    if (receiver_id != expected_receiver) {
-        LOG_WRN("Unexpected receiver ID: 0x%04X", receiver_id);
-        return false;
-    }
-
-    if (message_type != expected_type) { // Message type must match expected ID value based state-machine expectation.
-        LOG_WRN("Unexpected wireless message type: 0x%02X", message_type);
-        return false;
-    }
-
-    if (packet->length != (WIRELESS_HEADER_LEN + payload_length)) { // Total packet length must be equivalent to the sum of the header and payload length.
-        LOG_WRN("Wireless payload length mismatch");
-        return false;
-    }
-
-    return true;
-}
-
-static void handle_esb_message(const struct esb_payload *packet)
-{
-    switch (programmer_state) {
-    case WAIT_FOR_TAG_PAIR: // Wireless programmer is listening for a wireless pair request from the tag.
-        if (validate_pair_request(packet)) { // Make sure packet follows expected structure.
-            active_tag_id = read_u16(&packet->data[1]);
-            LOG_INF("Valid tag pair request received");
-            programmer_state = WAIT_FOR_TAG_DATA; // Wireless programmer should next expect to be sent some data from the tag once paired.
-            LOG_INF("Programmer now waiting for tag data");
-        }
-        break;
-
-    case WAIT_FOR_TAG_DATA: // Wireless programmer is listening for some data with the 'ESB_DATA message identifier.
-        if (validate_esb_packet(packet, active_tag_id, PROGRAMMER_ID, ESB_DATA)) {
-            tag_data_length = packet->data[6]; // Extracts the payload size according to the length byte
-
-            if (tag_data_length > 0) { // Only attempts to copy payload data if the length byte idicates that a payload exists.
-                memcpy(tag_data, &packet->data[7], tag_data_length); // Copy the payload data into persistent data storage.
-            }
-            LOG_INF("Valid tag data packet received, length=%u", tag_data_length);
-            
-            programmer_state = RELAY_DATA_TO_PC; // Enter next state where the received data is relayed to the PC over paired serial connection.
-        }
-        break;
-
-    default: // Log warning message if a packet is somehow received in wrong programmer state.
-        LOG_WRN("Unexpected programmer protocol state %d", programmer_state);
-        break;
-    }
-}
-
-/*
-        ESB TX packet construction helper.
-*/
-static void prepare_esb_packet(struct esb_payload *packet, uint16_t sender_id, uint16_t receiver_id, uint8_t message_type, const uint8_t *payload, uint8_t payload_length)
-{
-    // Specify transmission pipe and whether outbound packet requires acknowledgement.
-    packet->pipe = 0;
-    packet->noack = false;
-    // Write header information to the ESB packet.
-    packet->data[0] = PROTOCOL_HEADER;
-    write_u16(&packet->data[1], sender_id);
-    write_u16(&packet->data[3], receiver_id);
-    packet->data[5] = message_type;
-    packet->data[6] = payload_length;
-
-    // Iterate over the payload data and copy it into the ESB packet. Ignore step if payload is empty/NULL (occurs for acknowledgements/pair requests).
-    if (payload_length > 0 && payload != NULL) {
-        memcpy(&packet->data[7], payload, payload_length);
-    }
-
-    packet->length = WIRELESS_HEADER_LEN + payload_length; // Length is an attribute of ESB packets and exists separately of the 'length' header byte.
-}
-
-/*
-        Use-cases of packet transmission during the protocol.
-*/
-static int send_received_message(void)
-{
-    prepare_esb_packet(&tx_payload, PROGRAMMER_ID, active_tag_id, ESB_RECEIVED, NULL, 0);
-    LOG_INF("Sending RECEIVED confirmation to tag");
-    return esb_write_payload(&tx_payload);
-}
-
-/*
     FEM initialisation.
 */
 static int fem_pdn_init(void)
@@ -422,47 +267,21 @@ static int fem_pdn_init(void)
 }
 
 /*
-        Unique ESB events.
+    Programmer ID.
 */
-static void handle_rx_received(void)
+static int programmer_id_init(void)
 {
-    // Keep attempting to receive transmissions while esb_read_rx_payload returns successes (0).
-    while (esb_read_rx_payload(&rx_payload) == 0) {
-        handle_esb_message(&rx_payload); // Validate and process the message.
-    }
-}
+    uint8_t device_id[8];
 
-static void handle_tx_success(const struct esb_evt *event)
-{
-    LOG_INF("ESB TX success, attempts: %u", event->tx_attempts); // Log number of retransmission attempts.
-
-    // Different actions based on current programmer state.
-    switch(programmer_state) {
-    case WAIT_FOR_RECEIVED_ACK: // Awaiting acknowledgement that the tag received the PC's data acknowledgement.
-        LOG_INF("Tag acknowledged RECEIVED message");
-        programmer_state = SWITCH_TO_RX; // Return to receive mode ready for the tag's next data packet.
-        break;
-
-    default: // Unexpected success from unspecified ESB transmission.
-        LOG_WRN("Unexpected TX success in programmer state %d", programmer_state);
-        break;
-    }
-}
-
-static void handle_tx_failed(const struct esb_evt *event)
-{
-    LOG_WRN("ESB TX failed, attempts: %u", event->tx_attempts);
-
-    int err;
-    err = esb_pop_tx(); // Remove failed packet from the TX FIFO buffer so transmission can continue.
-    if (err) {
-        LOG_ERR("esb_pop_tx failed: %d", err);
+    // nRF hwinfo returns the 64-bit FICR DEVICEID big-endian, so the last four bytes are DEVICEID[0].
+    if (hwinfo_get_device_id(device_id, sizeof(device_id)) != sizeof(device_id)) {
+        LOG_ERR("Failed to read device ID");
+        return -EIO;
     }
 
-    // The tag times out and re-pairs if it misses RECEIVED, so return to PRX rather than waiting forever.
-    if (programmer_state == WAIT_FOR_RECEIVED_ACK) {
-        programmer_state = SWITCH_TO_RX;
-    }
+    programmer_id = sys_get_be32(&device_id[4]);
+    LOG_INF("Programmer ID 0x%08X", programmer_id);
+    return 0;
 }
 
 /*
@@ -470,18 +289,25 @@ static void handle_tx_failed(const struct esb_evt *event)
 */
 static void esb_eventhandler(const struct esb_evt *event)
 {
-    // Capture ESB event id property of ESB event (cases seen below).
+    static struct esb_payload payload;
+
     switch (event->evt_id) {
     case ESB_EVENT_RX_RECEIVED:
-        handle_rx_received();
+        while (esb_read_rx_payload(&payload) == 0) {
+            if (k_msgq_put(&radio_rx_queue, &payload, K_NO_WAIT) != 0) {
+                LOG_WRN("Radio RX queue full, packet dropped");
+            }
+        }
         break;
 
     case ESB_EVENT_TX_SUCCESS:
-        handle_tx_success(event);
+        tx_ok = true;
+        k_sem_give(&tx_done_sem);
         break;
 
     case ESB_EVENT_TX_FAILED:
-        handle_tx_failed(event);
+        tx_ok = false;
+        k_sem_give(&tx_done_sem);
         break;
 
     default:
@@ -532,9 +358,9 @@ static int esb_radio_init(enum esb_mode mode)
             LOG_ERR("Failed to start ESB RX: %d", err);
             return err;
         }
-        LOG_INF("ESB initialised as PRX");
+        LOG_DBG("ESB initialised as PRX");
     } else {
-        LOG_INF("ESB initialised as PTX"); // No additional steps since ESB transmissions can be called on-demand in automatic mode (which we are using).
+        LOG_DBG("ESB initialised as PTX"); // No additional steps since ESB transmissions can be called on-demand in automatic mode (which we are using).
     }
     return 0;
 }
@@ -566,6 +392,270 @@ static int esb_switch_mode(enum esb_mode current_mode, enum esb_mode new_mode)
 }
 
 /*
+    Radio send/receive. The programmer sits in PRX and only switches to PTX to send, so the tag's ACKs stay empty.
+*/
+static bool radio_send(picofix32UHFTagRX_t *message)
+{
+    struct esb_payload payload = {
+        .pipe = 0,
+        .noack = false,
+    };
+    uint16_t length = sizeof(picofix32UHFHeader_t) + message->header.u16length;
+    bool sent = false;
+
+    picofix_calculate_crc((uint8_t *)message, length);
+    payload.length = length;
+    memcpy(payload.data, message, length);
+
+    // Let the ACK for the packet that prompted this (and any retransmissions) go out before leaving PRX.
+    k_sleep(K_MSEC(ACK_GRACE_MS));
+
+    if (esb_switch_mode(ESB_MODE_PRX, ESB_MODE_PTX) == 0) {
+        k_sem_reset(&tx_done_sem);
+        if (esb_write_payload(&payload) == 0 &&
+            k_sem_take(&tx_done_sem, K_MSEC(ESB_TX_TIMEOUT_MS)) == 0) {
+            sent = tx_ok;
+        }
+    }
+
+    if (esb_switch_mode(ESB_MODE_PTX, ESB_MODE_PRX)) {
+        LOG_ERR("Failed to return to PRX");
+    }
+    return sent;
+}
+
+// Returns the packet as a PicoFix tag message if it is well formed, otherwise NULL.
+static const picofix32UHFTagTX_t *tag_message_from_packet(const struct esb_payload *packet)
+{
+    const picofix32UHFTagTX_t *message = (const picofix32UHFTagTX_t *)packet->data;
+
+    if (packet->length < sizeof(picofix32UHFHeader_t) ||
+        message->header.u8picofixTag != UHF_PICOFIX_32_TAG ||
+        packet->length != sizeof(picofix32UHFHeader_t) + message->header.u16length ||
+        !picofix_crc_ok(packet->data, packet->length)) {
+        return NULL;
+    }
+    return message;
+}
+
+// Waits for a message from the session tag, ignoring anything else. Returns NULL on timeout.
+static const picofix32UHFTagTX_t *receive_from_tag(struct esb_payload *packet, uint32_t timeout_ms)
+{
+    int64_t deadline = k_uptime_get() + timeout_ms;
+
+    while (true) {
+        int64_t remaining_ms = deadline - k_uptime_get();
+
+        if (remaining_ms <= 0 || k_msgq_get(&radio_rx_queue, packet, K_MSEC(remaining_ms)) != 0) {
+            return NULL;
+        }
+
+        const picofix32UHFTagTX_t *message = tag_message_from_packet(packet);
+
+        if (message != NULL &&
+            message->header.u32senderID == session_tag_id &&
+            message->header.u32receiverID == programmer_id) {
+            return message;
+        }
+        LOG_WRN("Ignoring packet that isn't from the session tag");
+    }
+}
+
+/*
+    Pairing. The tag only tries once per boot and listens for 200 ms, so PAIR_INIT is answered from the main loop and
+    from every blocking serial wait.
+*/
+static bool send_pair_ack(uint32_t tag_id, uint8_t status)
+{
+    picofix32UHFTagRX_t ack = {0};
+
+    ack.header.u8picofixTag = UHF_PICOFIX_32_BS;
+    ack.header.u8messageType = PICOFIX_V3_CONFIG_ACK;
+    ack.header.u32senderID = programmer_id;
+    ack.header.u32receiverID = tag_id;
+    ack.header.u16length = sizeof(picofix32UHF_pairAck_t);
+    ack.message.pairAck.u8status = status;
+
+    if (!radio_send(&ack)) {
+        LOG_WRN("Tag 0x%08X didn't ACK PAIR_ACK", tag_id);
+        return false;
+    }
+    return true;
+}
+
+static void service_radio_idle(void)
+{
+    struct esb_payload packet;
+
+    if (programmer_state == TAG_SESSION || session_pending) {
+        return;
+    }
+
+    while (k_msgq_get(&radio_rx_queue, &packet, K_NO_WAIT) == 0) {
+        const picofix32UHFTagTX_t *message = tag_message_from_packet(&packet);
+
+        if (message == NULL ||
+            message->header.u8messageType != PICOFIX_V3_CONFIG_INIT ||
+            packet.length != PICOFIX_32_MESSAGE_SIZE_PAIR_INIT) {
+            continue; // Only PAIR_INIT needs an answer outside a session.
+        }
+
+        uint32_t tag_id = message->header.u32senderID;
+
+        if (programmer_state != WAIT_FOR_TAG_PAIR) {
+            LOG_INF("Tag 0x%08X refused, no PC connected", tag_id);
+            send_pair_ack(tag_id, PAIR_STATUS_NO_HOST);
+            continue;
+        }
+
+        LOG_INF("Tag 0x%08X pairing", tag_id);
+        if (send_pair_ack(tag_id, PAIR_STATUS_HOST_PRESENT)) {
+            session_tag_id = tag_id;
+            session_pending = true;
+            return; // Leave the tag's following packets queued for the session.
+        }
+    }
+}
+
+// Sleeps while still answering PAIR_INIT.
+static void idle_wait(uint32_t ms)
+{
+    int64_t end = k_uptime_get() + ms;
+
+    while (k_uptime_get() < end) {
+        service_radio_idle();
+        k_sleep(K_MSEC(IDLE_SERVICE_SLICE_MS));
+    }
+}
+
+/*
+    Tag session.
+*/
+
+// Assembles the tag's next message: any TAG_PASSTHROUGH_CONT chunks (only ESB-ACKed), then TAG_PASSTHROUGH.
+// Returns its length, or -1 if the tag goes quiet or sends something else.
+static int receive_tag_passthrough(void)
+{
+    struct esb_payload packet;
+    uint16_t length = 0;
+    uint32_t timeout_ms = TAG_MESSAGE_TIMEOUT_MS;
+
+    while (true) {
+        const picofix32UHFTagTX_t *message = receive_from_tag(&packet, timeout_ms);
+
+        if (message == NULL) {
+            LOG_WRN("Tag message timed out");
+            return -1;
+        }
+
+        if (message->header.u8messageType != PICOFIX_V3_TAG_PASSTHROUGH &&
+            message->header.u8messageType != PICOFIX_V3_TAG_PASSTHROUGH_CONT) {
+            LOG_WRN("Unexpected tag message type 0x%02X", message->header.u8messageType);
+            return -1;
+        }
+
+        if (length + message->header.u16length > sizeof(tag_message)) {
+            LOG_WRN("Tag message too long");
+            return -1;
+        }
+
+        memcpy(&tag_message[length], message->message.blob, message->header.u16length);
+        length += message->header.u16length;
+
+        if (message->header.u8messageType == PICOFIX_V3_TAG_PASSTHROUGH) {
+            return length;
+        }
+        timeout_ms = TAG_CHUNK_TIMEOUT_MS;
+    }
+}
+
+// Sends a PC message to the tag as BASE_PASSTHROUGH_CONT chunks, each answered by the tag's BASE_CONT_ACK, then a
+// final BASE_PASSTHROUGH.
+static bool send_tag_passthrough(const uint8_t *data, uint16_t length)
+{
+    picofix32UHFTagRX_t message = {0};
+    struct esb_payload packet;
+
+    message.header.u8picofixTag = UHF_PICOFIX_32_BS;
+    message.header.u32senderID = programmer_id;
+    message.header.u32receiverID = session_tag_id;
+
+    while (length > PASSTHROUGH_CHUNK_LEN) {
+        message.header.u8messageType = PICOFIX_V3_BASE_PASSTHROUGH_CONT;
+        message.header.u16length = PASSTHROUGH_CHUNK_LEN;
+        memcpy(message.message.blob, data, PASSTHROUGH_CHUNK_LEN);
+
+        if (!radio_send(&message)) {
+            return false;
+        }
+
+        const picofix32UHFTagTX_t *ack = receive_from_tag(&packet, TAG_CONT_ACK_TIMEOUT_MS);
+
+        if (ack == NULL || ack->header.u8messageType != PICOFIX_V3_BASE_CONT_ACK) {
+            LOG_WRN("No BASE_CONT_ACK from tag");
+            return false;
+        }
+
+        data += PASSTHROUGH_CHUNK_LEN;
+        length -= PASSTHROUGH_CHUNK_LEN;
+    }
+
+    message.header.u8messageType = PICOFIX_V3_BASE_PASSTHROUGH;
+    message.header.u16length = length;
+    memcpy(message.message.blob, data, length);
+    return radio_send(&message);
+}
+
+// Forwards each tag message to the PC and the PC's reply to the tag, until the PC sends PASS_THROUGH_DISCONNECT or
+// either side stops responding. Leaves programmer_state set for what comes next.
+static void run_tag_session(void)
+{
+    LOG_INF("Tag 0x%08X session started", session_tag_id);
+
+    while (true) {
+        int length = receive_tag_passthrough();
+
+        if (length < 0) {
+            programmer_state = WAIT_FOR_TAG_PAIR;
+            break;
+        }
+
+        // The tag builds its pass-through messages as complete PC frames, so they're forwarded unchanged.
+        serial_transmit_raw(tag_message, length);
+
+        if (!serial_receive_packet(PC_REPLY_TIMEOUT_MS)) {
+            LOG_WRN("No reply from PC");
+            programmer_state = DISCONNECTED;
+            break;
+        }
+
+        uint16_t type = serialRXBuffer.header.u16messageType;
+
+        if (type != SERIAL_RX_PASS_THROUGH && type != SERIAL_RX_PASS_THROUGH_DISCONNECT) {
+            LOG_WRN("Unexpected PC message 0x%04X during tag session", type);
+            programmer_state = WAIT_FOR_TAG_PAIR;
+            break;
+        }
+
+        if (!send_tag_passthrough(serialRXBuffer.passThrough.payload, serialRXBuffer.header.u16length)) {
+            LOG_WRN("Tag stopped responding");
+            programmer_state = WAIT_FOR_TAG_PAIR;
+            break;
+        }
+
+        // The forwarded message tells the tag to disconnect, so the session ends without further messages.
+        if (type == SERIAL_RX_PASS_THROUGH_DISCONNECT) {
+            programmer_state = WAIT_FOR_TAG_PAIR;
+            break;
+        }
+    }
+
+    LOG_INF("Tag 0x%08X session ended", session_tag_id);
+    session_pending = false;
+    k_msgq_purge(&radio_rx_queue);
+}
+
+/*
     Main.
 */
 int main(void)
@@ -589,6 +679,11 @@ int main(void)
     }
     uart_irq_rx_enable(uart_dev);
 
+    err = programmer_id_init();
+    if (err) {
+        return 0;
+    }
+
     // Enable the FEM by manually activating the PDN pin.
     err = fem_pdn_init();
     if (err) {
@@ -602,99 +697,64 @@ int main(void)
         return 0;
     }
 
-    LOG_INF("Wireless programmer waiting for tag");
+    LOG_INF("Wireless programmer waiting for PC");
 
     // Keep looping over this logic.
     while (1){
         switch (programmer_state) {
         case DISCONNECTED:
-            k_sleep(K_MSEC(1000)); //attempt connection only every second
+            session_pending = false;
+            idle_wait(1000); //attempt connection only every second
             serialTXBuffer.header.u16messageType = SERIAL_TX_PAIR_REQUEST;
             serialTXBuffer.header.u16length = SERIAL_TX_PAIR_REQUEST_LEN;
             serialTXBuffer.pairRequest.u8devType = 1;
 
             serial_transmit_packet();
 
-            if(!serial_receive_packet() ||
+            if(!serial_receive_packet(PC_LINK_TIMEOUT_MS) ||
                 serialRXBuffer.header.u16messageType != SERIAL_RX_PAIR_REQUEST_ACK){
                 break;
             }
 
             serialTXBuffer.header.u16messageType = SERIAL_TX_FW_INFO;
             serialTXBuffer.header.u16length = SERIAL_TX_FW_INFO_LEN;
-            serialTXBuffer.fwInfo.u32gitRev = 0x12345678;
+            serialTXBuffer.fwInfo.u32gitRev = 0x12345678; //TODO: Add git revision with gitrev.h generated by prebuild
             serialTXBuffer.fwInfo.u8protocolVer = 0;
 
             serial_transmit_packet();
-            
-            if(!serial_receive_packet() ||
+
+            if(!serial_receive_packet(PC_LINK_TIMEOUT_MS) ||
                 serialRXBuffer.header.u16messageType != SERIAL_RX_FW_INFO_ACK ||
                 serialRXBuffer.fwInfoAck.u8status != 0){
                 break;
             }
+            LOG_INF("PC connected, waiting for tag");
             programmer_state = WAIT_FOR_TAG_PAIR;
             break;
+
         case WAIT_FOR_TAG_PAIR:
-        case WAIT_FOR_TAG_DATA:
+            service_radio_idle();
+            if (session_pending) {
+                programmer_state = TAG_SESSION;
+                break;
+            }
+
             if(k_uptime_get_32() - lastMessageTime > KEEP_ALVIE_INTERVAL_MS){
                 serialTXBuffer.header.u16messageType = SERIAL_TX_KEEP_ALIVE;
                 serialTXBuffer.header.u16length = SERIAL_TX_KEEP_ALIVE_LEN;
 
                 serial_transmit_packet();
 
-                if(!serial_receive_packet() || serialRXBuffer.header.u16messageType != SERIAL_RX_KEEP_ALIVE_ACK){
+                if(!serial_receive_packet(PC_LINK_TIMEOUT_MS) || serialRXBuffer.header.u16messageType != SERIAL_RX_KEEP_ALIVE_ACK){
                     programmer_state = DISCONNECTED;
                     break;
                 }
                 LOG_DBG("KEEP_ALIVE sent");
             }
             break;
-        case WAIT_FOR_RECEIVED_ACK:
-            break; // These states advance from ESB events.
 
-        case RELAY_DATA_TO_PC: // Received tag data needs to be relayed to the PC over serial connection,
-            LOG_INF("Relaying tag data to PC");
-            serialTXBuffer.header.u16messageType = SERIAL_TX_TAG_DATA;
-            serialTXBuffer.header.u16length = tag_data_length;
-            memcpy(serialTXBuffer.tagData.payload, tag_data, tag_data_length);
-
-            serial_transmit_packet();
-            if(!serial_receive_packet() || serialRXBuffer.header.u16messageType != SERIAL_RX_TAG_DATA_ACK){
-                programmer_state = DISCONNECTED;
-                break;
-            }
-
-            programmer_state = SEND_RECEIVED_TO_TAG;
-            break;
-
-        case SEND_RECEIVED_TO_TAG: // The PC data acknowledgement needs to be relayed back to the tag.
-            // The serial relay normally takes longer than this, but don't rely on it to protect the tag data's ACK.
-            k_sleep(K_MSEC(ACK_GRACE_MS));
-            err = esb_switch_mode(ESB_MODE_PRX, ESB_MODE_PTX); // Switch the wireless programmer into ESB TX mode.
-            if (err) {
-                LOG_ERR("Failed to switch ESB to PTX: %d", err);
-                break;
-            }
-
-            err = send_received_message(); // Call upon function to relay the PC's 'received' message over ESB.
-            if (err) {
-                LOG_ERR("Failed to send RECEIVED to tag: %d", err);
-                break;
-            }
-            programmer_state = WAIT_FOR_RECEIVED_ACK; // Await confirmation from the tag that it received the message.
-            break;
-
-        case SWITCH_TO_RX:
-            LOG_INF("Transfer complete; switching programmer back to PRX");
-
-            err = esb_switch_mode(ESB_MODE_PTX, ESB_MODE_PRX);
-            if (err) {
-                LOG_ERR("Failed to switch ESB back to PRX: %d", err);
-                break;
-            }
-
-            programmer_state = WAIT_FOR_TAG_DATA;
-            LOG_INF("Programmer ready for next tag data packet");
+        case TAG_SESSION:
+            run_tag_session();
             break;
 
         default:

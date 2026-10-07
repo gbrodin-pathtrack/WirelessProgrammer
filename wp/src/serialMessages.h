@@ -31,12 +31,7 @@ typedef struct serialKeepAlive_t{
     serialPacketHeader_t header;
 }serialKeepAlive_t;
 
-/* TEMPORARY */
-#define SERIAL_TX_TAG_DATA 0x008F
-typedef struct serialTagData_t{
-    serialPacketHeader_t header;
-    uint8_t payload[SERIAL_TX_MAX_PAYLOAD];
-}serialTagData_t;
+/* Tag pass-through messages are already complete PC frames, so they are forwarded as they are. */
 
 #define SERIAL_TX_HEADER 0x7470
 
@@ -45,7 +40,6 @@ typedef union serialTXMessage_t{
     serialPairRequest_t pairRequest;
     serialFWInfo_t fwInfo;
     serialKeepAlive_t keepAlive;
-    serialTagData_t tagData;
     uint8_t blob[SERIAL_TX_MAX_PAYLOAD + sizeof(serialPacketHeader_t) + 2 /* CRC */];
 }serialTXMessage_t;
 
@@ -69,13 +63,7 @@ typedef struct serialKeepAliveAck_t{
     serialPacketHeader_t header;
 } serialKeepAliveAck_t;
 
-/* TEMPORARY */
-#define SERIAL_RX_TAG_DATA_ACK 0x008E
-typedef struct serialTagDataAck_t{
-    serialPacketHeader_t header;
-}serialTagDataAck_t;
-
-/* UNUSED FOR NOW */
+/* Payload is sent to the tag. DISCONNECT's payload tells the tag to disconnect, ending the session. */
 #define SERIAL_RX_PASS_THROUGH 0x00B0
 #define SERIAL_RX_PASS_THROUGH_DISCONNECT 0x00D0
 typedef struct serialPassThrough_t{
@@ -91,6 +79,5 @@ typedef union serialRXMessage_t{
     serialFWInfoAck_t fwInfoAck;
     serialKeepAliveAck_t keepAliveAck;
     serialPassThrough_t passThrough;
-    serialTagDataAck_t tagDataAck;
     uint8_t blob[SERIAL_RX_MAX_PAYLOAD + sizeof(serialPacketHeader_t) + 2 /* CRC */];
 }serialRXMessage_t;
