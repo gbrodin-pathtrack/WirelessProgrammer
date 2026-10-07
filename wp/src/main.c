@@ -11,6 +11,7 @@
 #include <string.h>
 #include "serialMessages.h"
 #include "UHFMessages.h"
+#include "ESBSessionAddress.h"
 
 LOG_MODULE_REGISTER(wireless_programmer, LOG_LEVEL_INF);
 
@@ -55,7 +56,10 @@ static volatile uint32_t lastMessageTime;
 #define ACK_GRACE_MS            ((RETRANSMIT_COUNT * RETRANSMIT_DELAY_US) / 1000 + 1)
 
 // ESB address for pipe 0, the only pipe used. 0xE7 rather than 0xA_ bytes so the address doesn't continue the preamble's alternating 1010 pattern.
-static const uint8_t base_addr_0[4] = {0xE7, 0xE7, 0xE7, 0xE7};
+// Tags pair on the fixed base address, then the session moves to one derived from the tag's seed and both IDs.
+static const uint8_t pairing_base_addr[4] = {0xE7, 0xE7, 0xE7, 0xE7};
+static uint8_t session_base_addr[4];
+static const uint8_t *radio_base_addr = pairing_base_addr;
 static const uint8_t addr_prefix[1] = {0xE7};
 
 // Get device reference from a devicetree node identifier.
@@ -334,7 +338,7 @@ static int esb_radio_init(enum esb_mode mode)
         return err;
     }
 
-    err = esb_set_base_address_0(base_addr_0); // Set base addresss of pipe 0.
+    err = esb_set_base_address_0(radio_base_addr); // Set base addresss of pipe 0.
     if (err) {
         LOG_ERR("base address 0 failed: %d", err);
         return err;
@@ -389,6 +393,15 @@ static int esb_switch_mode(enum esb_mode current_mode, enum esb_mode new_mode)
         return err;
     }
     return 0;
+}
+
+// Moves pipe 0 to a new base address, staying in PRX.
+static void radio_set_base_address(const uint8_t *addr)
+{
+    radio_base_addr = addr;
+    if (esb_switch_mode(ESB_MODE_PRX, ESB_MODE_PRX)) {
+        LOG_ERR("Failed to change ESB address");
+    }
 }
 
 /*
@@ -510,11 +523,26 @@ static void service_radio_idle(void)
 
         LOG_INF("Tag 0x%08X pairing", tag_id);
         if (send_pair_ack(tag_id, PAIR_STATUS_HOST_PRESENT)) {
+            // The tag moves to the session address once it has ACKed PAIR_ACK, and waits 1 s before sending on it.
+            ESBSession_baseAddress(pairing_base_addr, message->message.pairInit.u16channelHoppingSeed, programmer_id,
+                                   tag_id, session_base_addr);
+            radio_set_base_address(session_base_addr);
             session_tag_id = tag_id;
             session_pending = true;
             return; // Leave the tag's following packets queued for the session.
         }
     }
+}
+
+// Ends the accepted or running session, going back to the pairing address for the next tag.
+static void end_session(void)
+{
+    if (!session_pending) {
+        return;
+    }
+    session_pending = false;
+    k_msgq_purge(&radio_rx_queue);
+    radio_set_base_address(pairing_base_addr);
 }
 
 // Sleeps while still answering PAIR_INIT.
@@ -651,8 +679,7 @@ static void run_tag_session(void)
     }
 
     LOG_INF("Tag 0x%08X session ended", session_tag_id);
-    session_pending = false;
-    k_msgq_purge(&radio_rx_queue);
+    end_session();
 }
 
 /*
@@ -703,7 +730,7 @@ int main(void)
     while (1){
         switch (programmer_state) {
         case DISCONNECTED:
-            session_pending = false;
+            end_session(); // A tag accepted just before the PC link dropped never gets its session.
             idle_wait(1000); //attempt connection only every second
             serialTXBuffer.header.u16messageType = SERIAL_TX_PAIR_REQUEST;
             serialTXBuffer.header.u16length = SERIAL_TX_PAIR_REQUEST_LEN;
