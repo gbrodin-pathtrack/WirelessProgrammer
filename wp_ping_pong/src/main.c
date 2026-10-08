@@ -15,6 +15,7 @@ LOG_MODULE_REGISTER(wp_ping_pong, LOG_LEVEL_INF);
     ESB ping/pong bring-up test against NMini (sandbox_pc_bin Pathtrack/src/nrfmodules/wireless_offload/wl_ping_pong.c).
     The programmer starts as PRX and NMini as PTX. Each side adds one to the counter it receives and sends it back,
     swapping PTX/PRX for every transfer so ESB ACKs stay empty. Each exchange is printed as plain text on uart20.
+    NMini appends its RSSI of the reply it is answering, so each line shows the signal strength in both directions.
 */
 
 // Radio settings must match NMini (sandbox_pc_bin Pathtrack/minisrc/common/esb/radio_profile.c/h).
@@ -26,6 +27,8 @@ static const uint8_t base_addr_0[4] = {0xE7, 0xE7, 0xE7, 0xE7};
 static const uint8_t addr_prefix[1] = {0xE7}; // Single pipe (pipe 0).
 
 #define COUNTER_LEN             4
+#define RX_PAYLOAD_LEN          (COUNTER_LEN + 1) // Counter followed by NMini's RSSI.
+#define TAG_RSSI_NONE           0 // NMini hasn't received a reply yet.
 #define TX_TIMEOUT_MS           100
 #define TURNAROUND_DELAY_MS     16
 
@@ -34,7 +37,14 @@ static const uint8_t addr_prefix[1] = {0xE7}; // Single pipe (pipe 0).
 static const struct device *uart_dev = DEVICE_DT_GET(DT_NODELABEL(uart20));
 static const struct device *gpio2_dev = DEVICE_DT_GET(DT_NODELABEL(gpio2));
 
-K_MSGQ_DEFINE(rx_counter_queue, sizeof(uint32_t), CONFIG_ESB_RX_FIFO_SIZE, 4);
+// ESB reports RSSI as a positive value meaning -rssi dBm.
+struct rx_counter {
+    uint32_t value;
+    uint8_t rssi;       // Programmer's RSSI of this packet.
+    uint8_t tag_rssi;   // NMini's RSSI of the reply this packet answers.
+};
+
+K_MSGQ_DEFINE(rx_counter_queue, sizeof(struct rx_counter), CONFIG_ESB_RX_FIFO_SIZE, 4);
 static K_SEM_DEFINE(tx_done_sem, 0, 1);
 static volatile bool tx_ok;
 
@@ -96,8 +106,12 @@ static void esb_eventhandler(const struct esb_evt *event)
     switch (event->evt_id) {
     case ESB_EVENT_RX_RECEIVED:
         while (esb_read_rx_payload(&rx_payload) == 0) {
-            if (rx_payload.length == COUNTER_LEN) {
-                uint32_t counter = sys_get_le32(rx_payload.data);
+            if (rx_payload.length == RX_PAYLOAD_LEN) {
+                struct rx_counter counter = {
+                    .value = sys_get_le32(rx_payload.data),
+                    .rssi = rx_payload.rssi,
+                    .tag_rssi = rx_payload.data[COUNTER_LEN],
+                };
 
                 (void)k_msgq_put(&rx_counter_queue, &counter, K_NO_WAIT);
             }
@@ -243,11 +257,11 @@ int main(void)
     serial_print("wp ping/pong ready, ch=%u\r\n", (unsigned int)RF_CHANNEL);
 
     while (1) {
-        uint32_t rx_counter;
+        struct rx_counter rx_counter;
         uint32_t tx_counter;
 
         k_msgq_get(&rx_counter_queue, &rx_counter, K_FOREVER);
-        tx_counter = rx_counter + 1;
+        tx_counter = rx_counter.value + 1;
 
         // Give NMini time to swap to PRX before replying. Staying in PRX meanwhile means its
         // retransmissions are still ACKed if it missed the first ACK.
@@ -256,11 +270,16 @@ int main(void)
         err = send_counter(tx_counter);
 
         // Printed after sending so the UART doesn't delay the reply.
+        serial_print("RX %u -> TX %u", (unsigned int)rx_counter.value, (unsigned int)tx_counter);
         if (err) {
-            serial_print("RX %u -> TX %u failed (%d)\r\n", (unsigned int)rx_counter, (unsigned int)tx_counter, err);
-        } else {
-            serial_print("RX %u -> TX %u\r\n", (unsigned int)rx_counter, (unsigned int)tx_counter);
+            serial_print(" failed (%d)", err);
         }
+        // ESB measures RSSI after the nRF21540 LNA, so remove its gain to give the level at the antenna.
+        serial_print(", RSSI wp %d dBm", -(int)rx_counter.rssi - CONFIG_MPSL_FEM_NRF21540_RX_GAIN_DB);
+        if (rx_counter.tag_rssi != TAG_RSSI_NONE) {
+            serial_print(" tag -%u dBm", (unsigned int)rx_counter.tag_rssi);
+        }
+        serial_print("\r\n");
 
         // Back to PRX whatever happened; NMini resends its counter if it missed the reply.
         err = esb_switch_mode(ESB_MODE_PTX, ESB_MODE_PRX);
