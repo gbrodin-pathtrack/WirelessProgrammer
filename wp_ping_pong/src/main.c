@@ -14,14 +14,33 @@ LOG_MODULE_REGISTER(wp_ping_pong, LOG_LEVEL_INF);
 /*
     ESB ping/pong bring-up test against NMini (sandbox_pc_bin Pathtrack/src/nrfmodules/wireless_offload/wl_ping_pong.c).
     The programmer starts as PRX and NMini as PTX. Each side adds one to the counter it receives and sends it back,
-    swapping PTX/PRX for every transfer so ESB ACKs stay empty. Each exchange is printed as plain text on uart20.
+    swapping PTX/PRX for every transfer so ESB ACKs stay empty. Each exchange is printed as plain text on RTT, or on
+    uart20 when SERIAL_OUTPUT_UART is set.
     NMini appends its RSSI of the reply it is answering, so each line shows the signal strength in both directions.
+
+    Builds for the wireless programmer by default (app.overlay adds the nRF21540 FEM). Build with -DFILE_SUFFIX=dk to
+    use app_dk.overlay instead and run on a plain nRF54L15 DK, for comparing RF performance against the programmer.
 */
+
+// Set to 1 to print on uart20 instead of RTT.
+#define SERIAL_OUTPUT_UART      1
 
 // Radio settings must match NMini (sandbox_pc_bin Pathtrack/minisrc/common/esb/radio_profile.c/h).
 #define RF_CHANNEL              23      // 2423 MHz: between Wi-Fi channels 1 and 6, clear of BLE advertising channel 38 (2426 MHz).
 #define RETRANSMIT_COUNT        3
 #define RETRANSMIT_DELAY_US     5000
+
+#if defined(CONFIG_MPSL_FEM_NRF21540_GPIO)
+// The nRF21540 PA adds its fixed gain on top (ESB doesn't split TX power with the FEM on nRF54L).
+#define TX_POWER_DBM            0
+#define FEM_TX_GAIN_DB          CONFIG_MPSL_FEM_NRF21540_TX_GAIN_DB
+#define FEM_RX_GAIN_DB          CONFIG_MPSL_FEM_NRF21540_RX_GAIN_DB
+#else
+#define TX_POWER_DBM            8       // nRF54L15 maximum; ESB falls back to 0 dBm for anything higher.
+#define FEM_TX_GAIN_DB          0
+#define FEM_RX_GAIN_DB          0
+#endif
+
 // 0xE7 rather than 0xA_ bytes so the address doesn't continue the preamble's alternating 1010 pattern.
 static const uint8_t base_addr_0[4] = {0xE7, 0xE7, 0xE7, 0xE7};
 static const uint8_t addr_prefix[1] = {0xE7}; // Single pipe (pipe 0).
@@ -34,8 +53,12 @@ static const uint8_t addr_prefix[1] = {0xE7}; // Single pipe (pipe 0).
 
 #define FEM_PDN_PIN 0
 
+#if SERIAL_OUTPUT_UART
 static const struct device *uart_dev = DEVICE_DT_GET(DT_NODELABEL(uart20));
+#endif
+#if defined(CONFIG_MPSL_FEM_NRF21540_GPIO)
 static const struct device *gpio2_dev = DEVICE_DT_GET(DT_NODELABEL(gpio2));
+#endif
 
 // ESB reports RSSI as a positive value meaning -rssi dBm.
 struct rx_counter {
@@ -53,7 +76,7 @@ static volatile bool tx_ok;
 */
 static void serial_print(const char *fmt, ...)
 {
-    char line[64];
+    char line[96];
     va_list args;
 
     va_start(args, fmt);
@@ -61,14 +84,20 @@ static void serial_print(const char *fmt, ...)
     va_end(args);
 
     len = MIN(len, (int)sizeof(line) - 1); // vsnprintk returns the untruncated length.
+#if SERIAL_OUTPUT_UART
     for (int i = 0; i < len; i++) {
         uart_poll_out(uart_dev, line[i]);
     }
+#else
+    // printk is routed through the logger to RTT, so each call should be a whole line to avoid interleaving.
+    printk("%.*s", len, line);
+#endif
 }
 
 /*
     FEM initialisation.
 */
+#if defined(CONFIG_MPSL_FEM_NRF21540_GPIO)
 static int fem_pdn_init(void)
 {
     int err;
@@ -95,6 +124,7 @@ static int fem_pdn_init(void)
     LOG_INF("nRF21540 PDN enabled on P2.00");
     return 0;
 }
+#endif
 
 /*
     ESB event handler.
@@ -147,6 +177,7 @@ static int esb_radio_init(enum esb_mode mode)
     config.retransmit_count = RETRANSMIT_COUNT;
     config.retransmit_delay = RETRANSMIT_DELAY_US;
     config.selective_auto_ack = true;
+    config.tx_output_power = TX_POWER_DBM;
 
     err = esb_init(&config);
     if (err) {
@@ -237,16 +268,20 @@ int main(void)
 
     LOG_INF("Wireless programmer ping/pong starting");
 
+#if SERIAL_OUTPUT_UART
     if (!device_is_ready(uart_dev)) {
         LOG_ERR("UART device not ready");
         return 0;
     }
+#endif
 
+#if defined(CONFIG_MPSL_FEM_NRF21540_GPIO)
     err = fem_pdn_init();
     if (err) {
         LOG_ERR("FEM PDN initialisation failed: %d", err);
         return 0;
     }
+#endif
 
     err = esb_radio_init(ESB_MODE_PRX);
     if (err) {
@@ -254,11 +289,14 @@ int main(void)
         return 0;
     }
 
-    serial_print("wp ping/pong ready, ch=%u\r\n", (unsigned int)RF_CHANNEL);
+    serial_print("wp ping/pong ready, ch=%u, radio %d dBm + PA %d dB\r\n", (unsigned int)RF_CHANNEL, TX_POWER_DBM,
+                 FEM_TX_GAIN_DB);
 
     while (1) {
         struct rx_counter rx_counter;
         uint32_t tx_counter;
+        char err_text[16] = "";
+        char tag_text[16] = "";
 
         k_msgq_get(&rx_counter_queue, &rx_counter, K_FOREVER);
         tx_counter = rx_counter.value + 1;
@@ -269,17 +307,16 @@ int main(void)
 
         err = send_counter(tx_counter);
 
-        // Printed after sending so the UART doesn't delay the reply.
-        serial_print("RX %u -> TX %u", (unsigned int)rx_counter.value, (unsigned int)tx_counter);
+        // Printed after sending so the output doesn't delay the reply.
         if (err) {
-            serial_print(" failed (%d)", err);
+            snprintk(err_text, sizeof(err_text), " failed (%d)", err);
+        }
+        if (rx_counter.tag_rssi != TAG_RSSI_NONE) {
+            snprintk(tag_text, sizeof(tag_text), " tag -%u dBm", (unsigned int)rx_counter.tag_rssi);
         }
         // ESB measures RSSI after the nRF21540 LNA, so remove its gain to give the level at the antenna.
-        serial_print(", RSSI wp %d dBm", -(int)rx_counter.rssi - CONFIG_MPSL_FEM_NRF21540_RX_GAIN_DB);
-        if (rx_counter.tag_rssi != TAG_RSSI_NONE) {
-            serial_print(" tag -%u dBm", (unsigned int)rx_counter.tag_rssi);
-        }
-        serial_print("\r\n");
+        serial_print("RX %u -> TX %u%s, RSSI wp %d dBm%s\r\n", (unsigned int)rx_counter.value,
+                     (unsigned int)tx_counter, err_text, -(int)rx_counter.rssi - FEM_RX_GAIN_DB, tag_text);
 
         // Back to PRX whatever happened; NMini resends its counter if it missed the reply.
         err = esb_switch_mode(ESB_MODE_PTX, ESB_MODE_PRX);

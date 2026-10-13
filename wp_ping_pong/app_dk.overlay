@@ -1,0 +1,2 @@
+// Plain nRF54L15 DK build (-DFILE_SUFFIX=dk), used in place of app.overlay.
+// Nothing to change: no FEM, and uart20 stays on the J-Link VCOM at its default pins and baud rate.
