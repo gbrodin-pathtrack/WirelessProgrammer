@@ -488,6 +488,7 @@ static bool send_pair_ack(uint32_t tag_id, uint8_t status)
     ack.header.u32receiverID = tag_id;
     ack.header.u16length = sizeof(picofix32UHF_pairAck_t);
     ack.message.pairAck.u8status = status;
+    ack.message.pairAck.u32maxBufferSize = TAG_MESSAGE_MAX_LEN;
 
     if (!radio_send(&ack)) {
         LOG_WRN("Tag 0x%08X didn't ACK PAIR_ACK", tag_id);

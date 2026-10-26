@@ -67,6 +67,8 @@ typedef struct picofix32UHF_pairInit_t {
 
 typedef struct  picofix32UHF_pairAck_t {
     uint8_t u8status;
+    uint8_t u8padding;
+    uint32_t u32maxBufferSize; /* Most pass-through bytes the base can take in one tag message */
 } picofix32UHF_pairAck_t;
 
 typedef union picofix32UHF_tagTXMessage_t {
