@@ -150,6 +150,46 @@ static void serial_transmit_packet()
     serial_transmit_raw(serialTXBuffer.blob, serialTXBuffer.header.u16length + sizeof(serialPacketHeader_t) + 2);
 }
 
+// Baud rate for a SERIAL_BAUD_ code, or 0 if the code isn't known.
+static uint32_t serial_baud_rate(uint8_t code)
+{
+    switch (code) {
+    case SERIAL_BAUD_57600:
+        return 57600;
+    case SERIAL_BAUD_76800:
+        return 76800;
+    case SERIAL_BAUD_115200:
+        return 115200;
+    case SERIAL_BAUD_1M:
+        return 1000000;
+    default:
+        return 0;
+    }
+}
+
+static bool serial_set_baud(uint32_t baudrate)
+{
+    struct uart_config cfg;
+
+    if (uart_config_get(uart_dev, &cfg) != 0) {
+        LOG_ERR("Failed to read UART config");
+        return false;
+    }
+    if (cfg.baudrate == baudrate) {
+        return true;
+    }
+
+    cfg.baudrate = baudrate;
+    if (uart_configure(uart_dev, &cfg) != 0) {
+        LOG_ERR("Failed to set UART to %u baud", baudrate);
+        return false;
+    }
+
+    // Anything received around the switch was at the wrong rate.
+    k_msgq_purge(&serial_rx_queue);
+    return true;
+}
+
 static void serial_rx_callback(const struct device *dev, void *user_data)
 {
     uint8_t rx_byte;
@@ -733,16 +773,32 @@ int main(void)
         case DISCONNECTED:
             end_session(); // A tag accepted just before the PC link dropped never gets its session.
             idle_wait(1000); //attempt connection only every second
+
+            // The PC always starts at the standard rate, a faster one is agreed in the pair request.
+            if (!serial_set_baud(serial_baud_rate(SERIAL_BAUD_57600))) {
+                break;
+            }
+
             serialTXBuffer.header.u16messageType = SERIAL_TX_PAIR_REQUEST;
             serialTXBuffer.header.u16length = SERIAL_TX_PAIR_REQUEST_LEN;
             serialTXBuffer.pairRequest.u8devType = 1;
+            serialTXBuffer.pairRequest.u8requestedBaud = SERIAL_BAUD_1M;
 
             serial_transmit_packet();
 
             if(!serial_receive_packet(PC_LINK_TIMEOUT_MS) ||
-                serialRXBuffer.header.u16messageType != SERIAL_RX_PAIR_REQUEST_ACK){
+                serialRXBuffer.header.u16messageType != SERIAL_RX_PAIR_REQUEST_ACK ||
+                serialRXBuffer.header.u16length < 1){
                 break;
             }
+
+            uint32_t baudrate = serial_baud_rate(serialRXBuffer.pairRequestAck.u8acceptedBaud);
+
+            if (baudrate == 0 || !serial_set_baud(baudrate)) {
+                break;
+            }
+            // Give the PC time to switch rate before the next message.
+            idle_wait(100);
 
             serialTXBuffer.header.u16messageType = SERIAL_TX_FW_INFO;
             serialTXBuffer.header.u16length = SERIAL_TX_FW_INFO_LEN;

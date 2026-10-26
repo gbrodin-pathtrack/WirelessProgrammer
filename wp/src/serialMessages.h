@@ -9,11 +9,18 @@ typedef struct serialPacketHeader_t{
 /************************* Bridge -> PC ***************************/
 #define SERIAL_TX_MAX_PAYLOAD 1024
 
+/* Baud rate codes for the pair request and its ack, must match the host's SerialBaud */
+#define SERIAL_BAUD_57600   0
+#define SERIAL_BAUD_76800   1
+#define SERIAL_BAUD_115200  2
+#define SERIAL_BAUD_1M      3
+
 #define SERIAL_TX_PAIR_REQUEST  0x0080
-#define SERIAL_TX_PAIR_REQUEST_LEN 1
+#define SERIAL_TX_PAIR_REQUEST_LEN 2
 typedef struct serialPairRequest_t{
     serialPacketHeader_t header;
     uint8_t u8devType;
+    uint8_t u8requestedBaud;
 } serialPairRequest_t;
 
 #define SERIAL_TX_FW_INFO  0x0081
@@ -50,6 +57,7 @@ typedef union serialTXMessage_t{
 #define SERIAL_RX_PAIR_REQUEST_ACK 0x0080
 typedef struct serialPairRequestAck_t{
     serialPacketHeader_t header;
+    uint8_t u8acceptedBaud;
 } serialPairRequestAck_t;
 
 #define SERIAL_RX_FW_INFO_ACK 0x0003
