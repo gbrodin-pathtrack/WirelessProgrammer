@@ -32,8 +32,7 @@ static uint32_t programmer_id;
 #define PICOFIX_MAX_PACKET          104
 #define PASSTHROUGH_CHUNK_LEN       (PICOFIX_MAX_PACKET - sizeof(picofix32UHFHeader_t))
 
-// Matches the tag's pass-through prep buffer (SCRATCH_UHF_PREP).
-#define TAG_MESSAGE_MAX_LEN         1408
+#define TAG_MESSAGE_MAX_LEN         32768
 
 #define TAG_MESSAGE_TIMEOUT_MS      5000    // The tag pings roughly every 2 s, and waits 1 s after PAIR_ACK before its first message.
 #define TAG_CHUNK_TIMEOUT_MS        1000
