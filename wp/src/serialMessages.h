@@ -14,6 +14,7 @@ typedef struct serialPacketHeader_t{
 #define SERIAL_BAUD_76800   1
 #define SERIAL_BAUD_115200  2
 #define SERIAL_BAUD_1M      3
+#define SERIAL_BAUD_2M      4
 
 #define SERIAL_TX_PAIR_REQUEST  0x0080
 #define SERIAL_TX_PAIR_REQUEST_LEN 2

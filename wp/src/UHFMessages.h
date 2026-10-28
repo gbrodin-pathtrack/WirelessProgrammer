@@ -20,6 +20,9 @@ typedef struct ptTimePacked_t {
 
 /* ------------------------------------------ Tag <-> BS (32-bit) ----------------------------------------- */
 
+/* Largest radio packet, header included, ESB's maximum payload. Must match the tag */
+#define PICOFIX_MAX_PACKET  252
+
 typedef struct picofix32UHFHeader_t {
     uint8_t u8picofixTag;
     uint8_t u8checkA;
@@ -77,13 +80,13 @@ typedef union picofix32UHF_tagTXMessage_t {
     picofix32UHF_dataStop_t dataStop;
     picofix32UHF_dataTransfer_t dataTransfer;
     picofix32UHF_pairInit_t pairInit;
-    uint8_t blob[100];
+    uint8_t blob[PICOFIX_MAX_PACKET - sizeof(picofix32UHFHeader_t)];
 } picofix32UHF_tagTXMessage_t;
 
 typedef union picofix32UHF_tagRXMessage_t {
     picofix32UHF_dataResponseContinue dataResponseContinue;
     picofix32UHF_pairAck_t pairAck;
-    uint8_t blob[100];
+    uint8_t blob[PICOFIX_MAX_PACKET - sizeof(picofix32UHFHeader_t)];
 } picofix32UHF_tagRXMessage_t;
 
 typedef struct picofix32UHFTagTX_t {

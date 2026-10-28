@@ -28,9 +28,11 @@ static uint32_t programmer_id;
 #define PAIR_STATUS_HOST_PRESENT    0
 #define PAIR_STATUS_NO_HOST         1
 
-// Largest PicoFix radio packet (the CC1120 fast-mode limit), so pass-through chunks carry 90 bytes.
-#define PICOFIX_MAX_PACKET          104
+// Pass-through chunks fill a whole radio packet after the header, 238 bytes.
 #define PASSTHROUGH_CHUNK_LEN       (PICOFIX_MAX_PACKET - sizeof(picofix32UHFHeader_t))
+
+BUILD_ASSERT(CONFIG_ESB_MAX_PAYLOAD_LENGTH >= PICOFIX_MAX_PACKET,
+             "CONFIG_ESB_MAX_PAYLOAD_LENGTH must fit a full pass-through packet");
 
 #define TAG_MESSAGE_MAX_LEN         32768
 
@@ -91,6 +93,11 @@ static uint32_t session_tag_id;
 
 // The tag's current pass-through message, assembled from its chunks.
 static uint8_t tag_message[TAG_MESSAGE_MAX_LEN];
+
+// Bytes of tag_message received so far, and how many of them the UART interrupt has sent on to the PC. The PC is sent
+// each chunk as it arrives, rather than waiting for the whole message.
+static atomic_t stream_received;
+static atomic_t stream_sent;
 
 static void service_radio_idle(void);
 
@@ -161,6 +168,8 @@ static uint32_t serial_baud_rate(uint8_t code)
         return 115200;
     case SERIAL_BAUD_1M:
         return 1000000;
+    case SERIAL_BAUD_2M:
+        return 2000000;
     default:
         return 0;
     }
@@ -189,21 +198,57 @@ static bool serial_set_baud(uint32_t baudrate)
     return true;
 }
 
-static void serial_rx_callback(const struct device *dev, void *user_data)
+static void serial_callback(const struct device *dev, void *user_data)
 {
     uint8_t rx_byte;
 
     ARG_UNUSED(user_data);
 
-    if (!uart_irq_update(dev) || !uart_irq_rx_ready(dev)) {
+    if (!uart_irq_update(dev)) {
         return;
     }
 
-    while (uart_fifo_read(dev, &rx_byte, 1) == 1) {
-        if (k_msgq_put(&serial_rx_queue, &rx_byte, K_NO_WAIT) != 0) {
-            atomic_set(&serial_rx_overflow, 1);
+    if (uart_irq_rx_ready(dev)) {
+        while (uart_fifo_read(dev, &rx_byte, 1) == 1) {
+            if (k_msgq_put(&serial_rx_queue, &rx_byte, K_NO_WAIT) != 0) {
+                atomic_set(&serial_rx_overflow, 1);
+            }
         }
     }
+
+    if (uart_irq_tx_ready(dev)) {
+        atomic_val_t sent = atomic_get(&stream_sent);
+        atomic_val_t pending = atomic_get(&stream_received) - sent;
+
+        if (pending > 0) {
+            atomic_add(&stream_sent, uart_fifo_fill(dev, &tag_message[sent], pending));
+        } else {
+            uart_irq_tx_disable(dev);
+        }
+    }
+}
+
+// Starts a new tag message, only called once the last one has been flushed.
+static void serial_stream_reset(void)
+{
+    atomic_set(&stream_sent, 0);
+    atomic_set(&stream_received, 0);
+}
+
+// Lets the UART interrupt send the first length bytes of tag_message.
+static void serial_stream_add(uint16_t length)
+{
+    atomic_set(&stream_received, length);
+    uart_irq_tx_enable(uart_dev);
+}
+
+// Waits until everything added has been handed to the UART, before anything else is sent or a reply is waited for.
+static void serial_stream_flush(void)
+{
+    while (atomic_get(&stream_sent) != atomic_get(&stream_received)) {
+        k_sleep(K_MSEC(1));
+    }
+    lastMessageTime = k_uptime_get_32();
 }
 
 static bool serial_receive_packet(uint32_t timeout_ms)
@@ -601,12 +646,16 @@ static void idle_wait(uint32_t ms)
 */
 
 // Assembles the tag's next message: any TAG_PASSTHROUGH_CONT chunks (only ESB-ACKed), then TAG_PASSTHROUGH.
-// Returns its length, or -1 if the tag goes quiet or sends something else.
+// The tag builds its pass-through messages as complete PC frames, so each chunk is streamed to the PC unchanged as it
+// arrives. Returns its length, or -1 if the tag goes quiet or sends something else, in which case the PC has been sent
+// part of it.
 static int receive_tag_passthrough(void)
 {
     struct esb_payload packet;
     uint16_t length = 0;
     uint32_t timeout_ms = TAG_MESSAGE_TIMEOUT_MS;
+
+    serial_stream_reset();
 
     while (true) {
         const picofix32UHFTagTX_t *message = receive_from_tag(&packet, timeout_ms);
@@ -629,6 +678,7 @@ static int receive_tag_passthrough(void)
 
         memcpy(&tag_message[length], message->message.blob, message->header.u16length);
         length += message->header.u16length;
+        serial_stream_add(length);
 
         if (message->header.u8messageType == PICOFIX_V3_TAG_PASSTHROUGH) {
             return length;
@@ -683,13 +733,13 @@ static void run_tag_session(void)
     while (true) {
         int length = receive_tag_passthrough();
 
+        // The PC's reply time only starts once it has the whole message.
+        serial_stream_flush();
+
         if (length < 0) {
             programmer_state = WAIT_FOR_TAG_PAIR;
             break;
         }
-
-        // The tag builds its pass-through messages as complete PC frames, so they're forwarded unchanged.
-        serial_transmit_raw(tag_message, length);
 
         if (!serial_receive_packet(PC_REPLY_TIMEOUT_MS)) {
             LOG_WRN("No reply from PC");
@@ -739,9 +789,9 @@ int main(void)
         return 0; // Exit if there is an error with the device.
     }
 
-    err = uart_irq_callback_user_data_set(uart_dev, serial_rx_callback, NULL);
+    err = uart_irq_callback_user_data_set(uart_dev, serial_callback, NULL);
     if (err) {
-        LOG_ERR("Failed to install UART RX callback: %d", err);
+        LOG_ERR("Failed to install UART callback: %d", err);
         return 0;
     }
     uart_irq_rx_enable(uart_dev);
