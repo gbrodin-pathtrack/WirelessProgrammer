@@ -31,6 +31,100 @@ static uint32_t programmer_id;
 // Pass-through chunks fill a whole radio packet after the header, 238 bytes.
 #define PASSTHROUGH_CHUNK_LEN       (PICOFIX_MAX_PACKET - sizeof(picofix32UHFHeader_t))
 
+// Bench test for the firmware update confirm. After the reboot request (F4) is passed on, the next CONNECT_ACK from the
+// PC is dropped as if its radio send failed, so the rebooted tag has to retry pairing while the PC thinks it is
+// connected. Off unless built with -DEXTRA_CFLAGS=-DWP_TEST_DROP_CONFIRM_CONNECT_ACK=1.
+#ifndef WP_TEST_DROP_CONFIRM_CONNECT_ACK
+#define WP_TEST_DROP_CONFIRM_CONNECT_ACK 0
+#endif
+
+#if WP_TEST_DROP_CONFIRM_CONNECT_ACK
+#define PC_TAG_COMMAND_FW_REBOOT    0x00F4
+#define PC_TAG_COMMAND_CONNECT_ACK  0x00B3
+
+static bool test_drop_connect_ack;
+
+// The PC's message for the tag starts with its own header then the command, both little-endian.
+static bool test_drop_message(const uint8_t *data, uint16_t length)
+{
+    if (length < 4) {
+        return false;
+    }
+
+    uint16_t command = sys_get_le16(&data[2]);
+
+    if (command == PC_TAG_COMMAND_FW_REBOOT) {
+        test_drop_connect_ack = true;
+        LOG_WRN("TEST: the next CONNECT_ACK will be dropped");
+    } else if (test_drop_connect_ack && command == PC_TAG_COMMAND_CONNECT_ACK) {
+        test_drop_connect_ack = false;
+        LOG_WRN("TEST: CONNECT_ACK dropped");
+        return true;
+    }
+    return false;
+}
+#endif
+
+// Bench test for a lost firmware update end reply. The tag's first F2 ACK is dropped instead of being passed to the PC,
+// and the session ended as if it had been lost on the radio, so the PC has to expect the tag back without it. Off unless
+// built with -DEXTRA_CFLAGS=-DWP_TEST_DROP_FW_END_ACK=1.
+#ifndef WP_TEST_DROP_FW_END_ACK
+#define WP_TEST_DROP_FW_END_ACK 0
+#endif
+
+#if WP_TEST_DROP_FW_END_ACK
+#define TAG_PC_COMMAND_FW_END_ACK   0x00F2
+
+static bool test_fw_end_ack_dropped;
+
+// The tag's message for the PC starts with its own header then the command, both little-endian.
+static bool test_drop_tag_message(const uint8_t *data, uint16_t length)
+{
+    if (test_fw_end_ack_dropped || length < 4 || sys_get_le16(&data[2]) != TAG_PC_COMMAND_FW_END_ACK) {
+        return false;
+    }
+    test_fw_end_ack_dropped = true;
+    LOG_WRN("TEST: F2 ACK dropped");
+    return true;
+}
+#endif
+
+// Bench tests for a bad or slow PC link during a tag session. Each acts once, on the first PC frame carrying the given
+// tag command, for example 0xF1 for a firmware block or 0xF4 for the reboot request. Off unless built with
+// -DEXTRA_CFLAGS=-DWP_TEST_CORRUPT_PC_COMMAND=<command> (a payload byte is flipped as if corrupted on the serial line,
+// so the WP should send CRC_FAIL and take the PC's resend) or -DWP_TEST_LATE_PC_COMMAND=<command> (the frame is put back
+// in the RX queue and treated as not having arrived in time, so the WP should end only the tag session and must not
+// take the late frame as the next reply or keep-alive ACK).
+#ifndef WP_TEST_CORRUPT_PC_COMMAND
+#define WP_TEST_CORRUPT_PC_COMMAND 0
+#endif
+#ifndef WP_TEST_LATE_PC_COMMAND
+#define WP_TEST_LATE_PC_COMMAND 0
+#endif
+
+#if WP_TEST_CORRUPT_PC_COMMAND || WP_TEST_LATE_PC_COMMAND
+// The PC frame's six-byte header is followed by its message for the tag: that message's own header then the command.
+#define TEST_PC_FRAME_COMMAND_OFFSET 8
+
+static bool test_pc_frame_is(const uint8_t *frame, uint16_t length, uint16_t command, bool *done)
+{
+    if (*done || length < TEST_PC_FRAME_COMMAND_OFFSET + 2 + 2 /* checksum */ ||
+        sys_get_le16(&frame[TEST_PC_FRAME_COMMAND_OFFSET]) != command) {
+        return false;
+    }
+    *done = true;
+    return true;
+}
+#endif
+
+#if WP_TEST_CORRUPT_PC_COMMAND
+static bool test_pc_frame_corrupted;
+#endif
+
+#if WP_TEST_LATE_PC_COMMAND
+static bool test_pc_frame_late;
+#endif
+
 BUILD_ASSERT(CONFIG_ESB_MAX_PAYLOAD_LENGTH >= PICOFIX_MAX_PACKET,
              "CONFIG_ESB_MAX_PAYLOAD_LENGTH must fit a full pass-through packet");
 
@@ -251,7 +345,17 @@ static void serial_stream_flush(void)
     lastMessageTime = k_uptime_get_32();
 }
 
-static bool serial_receive_packet(uint32_t timeout_ms)
+static void serial_send_crc_fail(void)
+{
+    serialTXBuffer.header.u16messageType = SERIAL_TX_CRC_FAIL;
+    serialTXBuffer.header.u16length = SERIAL_TX_CRC_FAIL_LEN;
+    serial_transmit_packet();
+}
+
+// Waits for a complete frame from the PC with a good checksum. A corrupted frame means the PC is still there, so it is
+// dropped and the wait carries on. With report_corrupt the PC is told, which makes it resend, and the wait restarts.
+// The tag's own timeout bounds how long a session can keep retrying.
+static bool serial_receive_packet(uint32_t timeout_ms, bool report_corrupt)
 {
     uint32_t start_ms = k_uptime_get_32();
     uint16_t msg_idx = 0;
@@ -271,7 +375,14 @@ static bool serial_receive_packet(uint32_t timeout_ms)
             atomic_set(&serial_rx_overflow, 0);
             k_msgq_purge(&serial_rx_queue);
             LOG_WRN("Serial RX queue overflow");
-            return false;
+            // Bytes were lost, so whatever was being received is corrupt
+            msg_idx = 0;
+            expected_len = 0;
+            if (report_corrupt) {
+                serial_send_crc_fail();
+                start_ms = k_uptime_get_32();
+            }
+            continue;
         }
 
         // Wait in short slices so a tag's PAIR_INIT is still answered while the PC is slow to reply.
@@ -297,18 +408,27 @@ static bool serial_receive_packet(uint32_t timeout_ms)
         }
 
         serialRXBuffer.blob[msg_idx++] = rx_byte;
+        bool corrupt = false;
 
         if (msg_idx == sizeof(serialPacketHeader_t)) {
             if (serialRXBuffer.header.u16length > SERIAL_RX_MAX_PAYLOAD) {
-                msg_idx = 0;
-                continue;
+                corrupt = true;
+            } else {
+                expected_len = serialRXBuffer.header.u16length + sizeof(serialPacketHeader_t) + 2;
             }
-            expected_len = serialRXBuffer.header.u16length + sizeof(serialPacketHeader_t) + 2;
         }
 
         if (expected_len != 0 && msg_idx == expected_len) {
             uint8_t check_a = 0;
             uint8_t check_b = 0;
+
+#if WP_TEST_CORRUPT_PC_COMMAND
+            if (report_corrupt && test_pc_frame_is(serialRXBuffer.blob, expected_len, WP_TEST_CORRUPT_PC_COMMAND,
+                                                   &test_pc_frame_corrupted)) {
+                serialRXBuffer.blob[expected_len - 3] ^= 0x01;
+                LOG_WRN("TEST: PC frame for command 0x%04X corrupted", WP_TEST_CORRUPT_PC_COMMAND);
+            }
+#endif
 
             for (uint16_t i = 0;
                  i < expected_len - 2; i++) {
@@ -316,8 +436,23 @@ static bool serial_receive_packet(uint32_t timeout_ms)
                 check_b += check_a;
             }
 
-            return check_a == serialRXBuffer.blob[expected_len - 2] &&
-                   check_b == serialRXBuffer.blob[expected_len - 1];
+            if (check_a == serialRXBuffer.blob[expected_len - 2] &&
+                check_b == serialRXBuffer.blob[expected_len - 1]) {
+                return true;
+            }
+
+            corrupt = true;
+        }
+
+        if (corrupt) {
+            LOG_WRN("Corrupt frame from PC");
+            msg_idx = 0;
+            expected_len = 0;
+            if (report_corrupt) {
+                serial_send_crc_fail();
+                // The resend needs its own time to arrive
+                start_ms = k_uptime_get_32();
+            }
         }
     }
 }
@@ -671,6 +806,13 @@ static int receive_tag_passthrough(void)
             return -1;
         }
 
+#if WP_TEST_DROP_FW_END_ACK
+        // Only the start of a message holds its command, and nothing of it has reached the PC yet
+        if (length == 0 && test_drop_tag_message(message->message.blob, message->header.u16length)) {
+            return -1;
+        }
+#endif
+
         if (length + message->header.u16length > sizeof(tag_message)) {
             LOG_WRN("Tag message too long");
             return -1;
@@ -693,6 +835,12 @@ static bool send_tag_passthrough(const uint8_t *data, uint16_t length)
 {
     picofix32UHFTagRX_t message = {0};
     struct esb_payload packet;
+
+#if WP_TEST_DROP_CONFIRM_CONNECT_ACK
+    if (test_drop_message(data, length)) {
+        return false;
+    }
+#endif
 
     message.header.u8picofixTag = UHF_PICOFIX_32_BS;
     message.header.u32senderID = programmer_id;
@@ -731,6 +879,10 @@ static void run_tag_session(void)
     LOG_INF("Tag 0x%08X session started", session_tag_id);
 
     while (true) {
+        // A late reply from an earlier session, or a duplicate the PC resent after a CRC_FAIL, mustn't be taken as the
+        // reply to this message. Done before streaming starts, as the PC can't reply to this message before then.
+        k_msgq_purge(&serial_rx_queue);
+
         int length = receive_tag_passthrough();
 
         // The PC's reply time only starts once it has the whole message.
@@ -741,11 +893,29 @@ static void run_tag_session(void)
             break;
         }
 
-        if (!serial_receive_packet(PC_REPLY_TIMEOUT_MS)) {
+        if (!serial_receive_packet(PC_REPLY_TIMEOUT_MS, true)) {
+            // The PC may only be slow, the keep-alive finds out whether it has gone.
             LOG_WRN("No reply from PC");
-            programmer_state = DISCONNECTED;
+            programmer_state = WAIT_FOR_TAG_PAIR;
             break;
         }
+
+#if WP_TEST_LATE_PC_COMMAND
+        uint16_t frame_len = serialRXBuffer.header.u16length + sizeof(serialPacketHeader_t) + 2;
+
+        if (test_pc_frame_is(serialRXBuffer.blob, frame_len, WP_TEST_LATE_PC_COMMAND, &test_pc_frame_late)) {
+            for (uint16_t i = 0; i < frame_len; i++) {
+                if (k_msgq_put(&serial_rx_queue, &serialRXBuffer.blob[i], K_NO_WAIT) != 0) {
+                    LOG_WRN("TEST: RX queue full, late frame only partly queued");
+                    break;
+                }
+            }
+            LOG_WRN("TEST: PC frame for command 0x%04X treated as late", WP_TEST_LATE_PC_COMMAND);
+            LOG_WRN("No reply from PC");
+            programmer_state = WAIT_FOR_TAG_PAIR;
+            break;
+        }
+#endif
 
         uint16_t type = serialRXBuffer.header.u16messageType;
 
@@ -835,7 +1005,7 @@ int main(void)
 
             serial_transmit_packet();
 
-            if(!serial_receive_packet(PC_LINK_TIMEOUT_MS) ||
+            if(!serial_receive_packet(PC_LINK_TIMEOUT_MS, false) ||
                 serialRXBuffer.header.u16messageType != SERIAL_RX_PAIR_REQUEST_ACK ||
                 serialRXBuffer.header.u16length < 1){
                 break;
@@ -856,7 +1026,7 @@ int main(void)
 
             serial_transmit_packet();
 
-            if(!serial_receive_packet(PC_LINK_TIMEOUT_MS) ||
+            if(!serial_receive_packet(PC_LINK_TIMEOUT_MS, false) ||
                 serialRXBuffer.header.u16messageType != SERIAL_RX_FW_INFO_ACK ||
                 serialRXBuffer.fwInfoAck.u8status != 0){
                 break;
@@ -876,9 +1046,12 @@ int main(void)
                 serialTXBuffer.header.u16messageType = SERIAL_TX_KEEP_ALIVE;
                 serialTXBuffer.header.u16length = SERIAL_TX_KEEP_ALIVE_LEN;
 
+                // A late tag session reply mustn't be taken as the ACK.
+                k_msgq_purge(&serial_rx_queue);
                 serial_transmit_packet();
 
-                if(!serial_receive_packet(PC_LINK_TIMEOUT_MS) || serialRXBuffer.header.u16messageType != SERIAL_RX_KEEP_ALIVE_ACK){
+                if(!serial_receive_packet(PC_LINK_TIMEOUT_MS, false) || serialRXBuffer.header.u16messageType != SERIAL_RX_KEEP_ALIVE_ACK){
+                    LOG_WRN("PC stopped responding");
                     programmer_state = DISCONNECTED;
                     break;
                 }

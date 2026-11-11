@@ -39,6 +39,10 @@ typedef struct serialKeepAlive_t{
     serialPacketHeader_t header;
 }serialKeepAlive_t;
 
+/* Tells the PC its last message arrived corrupted, the PC then resends it */
+#define SERIAL_TX_CRC_FAIL  0x00FE
+#define SERIAL_TX_CRC_FAIL_LEN 0
+
 /* Tag pass-through messages are already complete PC frames, so they are forwarded as they are. */
 
 #define SERIAL_TX_HEADER 0x7470
