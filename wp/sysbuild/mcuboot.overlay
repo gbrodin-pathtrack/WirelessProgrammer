@@ -1,0 +1,18 @@
+/* The RRAM layout shared with the app, which sets where MCUboot writes and boots the app */
+#include "../flash_layout.dtsi"
+
+/* MCUboot's serial recovery uses the app's UART to the PC, at a faster rate than the app starts at */
+#include "../uart_pc.dtsi"
+
+/ {
+	chosen {
+		/* Replaces MCUboot's own app.overlay, so it has to say where MCUboot itself goes */
+		zephyr,code-partition = &boot_partition;
+		zephyr,console = &uart20;
+		zephyr,uart-mcumgr = &uart20;
+	};
+};
+
+&uart20 {
+	current-speed = <115200>;
+};

@@ -126,6 +126,53 @@ static bool test_pc_frame_corrupted;
 static bool test_pc_frame_late;
 #endif
 
+// Bench test for how soon after power-on a PC can talk to the WP, to size a boot-time wait for MCUboot serial
+// recovery. Run with scripts/measure_com_port.ps1, which opens the port and sends bytes as soon as it appears. The
+// uptime and value of the first byte received, and the reset cause, are logged once and sent back to the PC as a text
+// line the script prints, so no debugger is needed. Off unless built with -DEXTRA_CFLAGS=-DWP_TEST_FIRST_PC_BYTE=1.
+#ifndef WP_TEST_FIRST_PC_BYTE
+#define WP_TEST_FIRST_PC_BYTE 0
+#endif
+
+#if WP_TEST_FIRST_PC_BYTE
+static volatile uint32_t test_first_pc_byte_ms;
+static volatile uint8_t test_first_pc_byte_value;
+static volatile bool test_first_pc_byte_seen;
+
+static void serial_transmit_raw(const uint8_t *buffer, uint16_t len);
+
+// Called for each byte in the UART interrupt, only records the first
+static void test_record_pc_byte(uint8_t value)
+{
+    if (!test_first_pc_byte_seen) {
+        test_first_pc_byte_ms = k_uptime_get_32();
+        test_first_pc_byte_value = value;
+        test_first_pc_byte_seen = true;
+    }
+}
+
+static void test_report_first_pc_byte(void)
+{
+    static bool reported;
+    uint32_t reset_cause = 0;
+    char line[96];
+    int len;
+
+    if (!test_first_pc_byte_seen || reported) {
+        return;
+    }
+    reported = true;
+
+    // No flags set means a power-on reset
+    (void)hwinfo_get_reset_cause(&reset_cause);
+    LOG_WRN("TEST: first byte from PC 0x%02X %u ms after start, reset cause 0x%08X", test_first_pc_byte_value,
+            test_first_pc_byte_ms, reset_cause);
+    len = snprintk(line, sizeof(line), "\r\nWPTEST first_byte_ms=%u value=0x%02X reset_cause=0x%08X\r\n",
+                   test_first_pc_byte_ms, test_first_pc_byte_value, reset_cause);
+    serial_transmit_raw((const uint8_t *)line, (uint16_t)MIN(len, (int)sizeof(line) - 1));
+}
+#endif
+
 BUILD_ASSERT(CONFIG_ESB_MAX_PAYLOAD_LENGTH >= PICOFIX_MAX_PACKET,
              "CONFIG_ESB_MAX_PAYLOAD_LENGTH must fit a full pass-through packet");
 
@@ -305,6 +352,9 @@ static void serial_callback(const struct device *dev, void *user_data)
 
     if (uart_irq_rx_ready(dev)) {
         while (uart_fifo_read(dev, &rx_byte, 1) == 1) {
+#if WP_TEST_FIRST_PC_BYTE
+            test_record_pc_byte(rx_byte);
+#endif
             if (k_msgq_put(&serial_rx_queue, &rx_byte, K_NO_WAIT) != 0) {
                 atomic_set(&serial_rx_overflow, 1);
             }
@@ -989,6 +1039,9 @@ int main(void)
 
     // Keep looping over this logic.
     while (1){
+#if WP_TEST_FIRST_PC_BYTE
+        test_report_first_pc_byte();
+#endif
         switch (programmer_state) {
         case DISCONNECTED:
             end_session(); // A tag accepted just before the PC link dropped never gets its session.

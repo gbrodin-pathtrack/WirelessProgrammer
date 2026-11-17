@@ -30,14 +30,4 @@ add_custom_target(git_revision_refresh
 add_dependencies(app git_revision_refresh)
 target_include_directories(app PRIVATE ${GIT_REVISION_DIR})
 
-# Copies the built hex to release/, named after the revision it was built from
-add_custom_target(wp_release ALL
-    COMMAND ${CMAKE_COMMAND}
-            -DHEADER=${GIT_REVISION_HEADER}
-            -DSOURCE_HEX=${PROJECT_BINARY_DIR}/zephyr/${CONFIG_KERNEL_BIN_NAME}.hex
-            -DRELEASE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/release
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/package_release.cmake
-    COMMENT "Packaging wireless programmer release"
-    VERBATIM
-)
-add_dependencies(wp_release zephyr_final git_revision_refresh)
+# Release packaging is done by sysbuild/CMakeLists.txt, once MCUboot and the app are merged

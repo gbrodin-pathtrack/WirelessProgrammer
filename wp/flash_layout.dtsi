@@ -1,0 +1,44 @@
+/*
+ * Wireless programmer RRAM layout, shared by MCUboot and the app.
+ *
+ *   0x00000 - 0x0F800  MCUboot
+ *   0x0F800 - 0x10000  Unused, so MCUboot fits the nRF54L15's 62 KiB FPROTECT limit
+ *   0x10000 - 0x50000  App image (header + application), replaced in place by serial recovery
+ *   0x50000 - 0x17D000 Storage, to the end of RRAM
+ *
+ * MCUboot and the app image are fixed once WPs are in use: MCUboot can only be replaced over SWD, and it writes and
+ * boots the app image at the address and size it was built with. They are set here rather than taken from the DK
+ * board files so an SDK update can't move them. MCUboot never touches the storage partition, so a later app can
+ * repartition it.
+ */
+
+/* Single-slot MCUboot has no second slot, and the DK's storage is replaced by the larger one below */
+/delete-node/ &slot1_partition;
+/delete-node/ &storage_partition;
+
+&cpuapp_rram {
+	partitions {
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		boot_partition: partition@0 {
+			compatible = "zephyr,mapped-partition";
+			label = "mcuboot";
+			/* MCUboot write-locks its partition with FPROTECT before starting the app, which covers at most
+			 * 62 KiB on the nRF54L15 */
+			reg = <0x00000000 0x0000f800>;
+		};
+
+		slot0_partition: partition@10000 {
+			compatible = "zephyr,mapped-partition";
+			label = "image-0";
+			reg = <0x00010000 0x00040000>;
+		};
+
+		storage_partition: partition@50000 {
+			compatible = "zephyr,mapped-partition";
+			label = "storage";
+			reg = <0x00050000 0x0012d000>;
+		};
+	};
+};
